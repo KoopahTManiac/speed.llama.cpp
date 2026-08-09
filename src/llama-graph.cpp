@@ -3791,18 +3791,33 @@ ggml_tensor * llm_graph_context::build_dspark_sampled_pick(
     const int64_t n_cols  = logits->ne[1];
     const int64_t n_cand  = inp_topk_mask->ne[0];
 
-    // sorted top-capacity candidates per column
-    ggml_tensor * idx = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, logits, (int) n_cand)); // [n_cand, n_cols] I32, desc
+    // fast top-k selection of the candidates (unordered), ordered afterwards
+    // by a small sort of just the survivors - a full-vocab sort per pick is
+    // far more expensive than selection + an n_cand-wide sort
+    ggml_tensor * idx_u = ggml_top_k(ctx0, logits, (int) n_cand); // [n_cand, n_cols] I32, unordered
 
     // gather the candidate logits: lift indices to f32, add per-column vocab
     // offsets, and read the logits as one flat row
-    ggml_tensor * idxf = ggml_get_rows(ctx0, iota, ggml_reshape_1d(ctx0, idx, n_cand*n_cols));
-    idxf = ggml_reshape_2d(ctx0, ggml_cont(ctx0, idxf), n_cand, n_cols);
+    ggml_tensor * idxf_u = ggml_get_rows(ctx0, iota, ggml_reshape_1d(ctx0, idx_u, n_cand*n_cols));
+    idxf_u = ggml_reshape_2d(ctx0, ggml_cont(ctx0, idxf_u), n_cand, n_cols);
 
-    ggml_tensor * flat = ggml_cast(ctx0, ggml_add(ctx0, idxf, vocab_offs), GGML_TYPE_I32);
-    ggml_tensor * vals = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, logits, 1, n_vocab*n_cols),
-                                       ggml_reshape_1d(ctx0, flat, n_cand*n_cols));
-    vals = ggml_reshape_2d(ctx0, ggml_cont(ctx0, vals), n_cand, n_cols);
+    ggml_tensor * flat_u = ggml_cast(ctx0, ggml_add(ctx0, idxf_u, vocab_offs), GGML_TYPE_I32);
+    ggml_tensor * vals_u = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, logits, 1, n_vocab*n_cols),
+                                         ggml_reshape_1d(ctx0, flat_u, n_cand*n_cols));
+    vals_u = ggml_reshape_2d(ctx0, ggml_cont(ctx0, vals_u), n_cand, n_cols);
+
+    // order the candidates descending (n_cand-wide bitonic)
+    ggml_tensor * perm  = ggml_argsort(ctx0, vals_u, GGML_SORT_ORDER_DESC); // [n_cand, n_cols] I32
+    ggml_tensor * permf = ggml_get_rows(ctx0, iota, ggml_reshape_1d(ctx0, perm, n_cand*n_cols));
+    permf = ggml_reshape_2d(ctx0, ggml_cont(ctx0, permf), n_cand, n_cols);
+
+    ggml_tensor * flat_p = ggml_reshape_1d(ctx0,
+            ggml_cast(ctx0, ggml_add(ctx0, permf, cand_offs), GGML_TYPE_I32), n_cand*n_cols);
+
+    ggml_tensor * vals = ggml_reshape_2d(ctx0, ggml_cont(ctx0,
+            ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, vals_u, 1, n_cand*n_cols), flat_p)), n_cand, n_cols);
+    ggml_tensor * idxf = ggml_reshape_2d(ctx0, ggml_cont(ctx0,
+            ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, idxf_u, 1, n_cand*n_cols), flat_p)), n_cand, n_cols);
 
     // top-k truncation
     vals = ggml_add(ctx0, vals, inp_topk_mask);
@@ -3831,10 +3846,12 @@ ggml_tensor * llm_graph_context::build_dspark_sampled_pick(
     ggml_tensor * pos = ggml_scale_bias(ctx0, ggml_sum_rows(ctx0, hit), -1.0f, (float) n_cand); // [1, n_cols]
 
     // resolve the selected candidate rank back to a vocab token id
-    ggml_tensor * sel = ggml_cast(ctx0, ggml_add(ctx0, pos, cand_offs), GGML_TYPE_I32);
+    ggml_tensor * sel = ggml_reshape_1d(ctx0,
+            ggml_cast(ctx0, ggml_add(ctx0, pos, cand_offs), GGML_TYPE_I32), n_cols);
 
-    return ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, idx, 1, n_cand*n_cols),
-                                               ggml_reshape_1d(ctx0, sel, n_cols)), n_cols);
+    ggml_tensor * tokf = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, idxf, 1, n_cand*n_cols), sel); // [1, n_cols] F32
+
+    return ggml_reshape_1d(ctx0, ggml_cast(ctx0, tokf, GGML_TYPE_I32), n_cols);
 }
 
 ggml_tensor * llm_graph_context::build_dspark_sampled_pick_flat(
