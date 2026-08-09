@@ -807,6 +807,94 @@ static __global__ void mul_mat_vec_q_moe(
     }
 }
 
+// MoE finalize kernel: like mul_mat_vec_q_moe, but the expert-slot dimension
+// moves from the grid into an in-block loop that accumulates
+// sum_slot w[slot,token] * scale[expert] * (W[expert] y[slot,token]) - the
+// down projection, per-expert global scale, routing weights, and the
+// expert-sum reduction in one launch. Deterministic: the slot loop is a
+// fixed-order per-thread accumulation, no atomics. Memory pattern matches
+// the unfused kernel (every (slot, token) pair streams its expert rows
+// exactly once). x_scale_ptr may be null (checked at runtime - the branch
+// is negligible next to the dot products).
+template <ggml_type type, int c_rows_per_block, bool c_arch_max_bound = false>
+__launch_bounds__(c_arch_max_bound
+        ? GGML_CUDA_ARCH_MAX_THREADS_PER_BLOCK
+        : get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_moe_reduce(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr,
+        const float * x_scale_ptr, const float * token_weight_ptr,
+        float * dst_ptr,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint32_t n_slots,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t ncols_dst, const uint32_t ids_stride) {
+    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+    const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
+    const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const uint32_t token_idx   = threadIdx.y;
+    const int      row0        = c_rows_per_block*blockIdx.x;
+    const int      blocks_per_row_x = ncols_x / qk;
+    constexpr int  blocks_per_iter  = vdr * warp_size / qi;
+
+    if (token_idx >= ncols_dst) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    float acc[c_rows_per_block] = {0.0f};
+
+    for (uint32_t slot = 0; slot < n_slots; ++slot) {
+        const uint32_t channel_x = ids[slot + token_idx * ids_stride];
+
+        float w = token_weight_ptr[slot + token_idx * n_slots];
+        if (x_scale_ptr != nullptr) {
+            w *= x_scale_ptr[channel_x];
+        }
+
+        const block_q8_1 * y = ((const block_q8_1 *) vy) + slot*stride_channel_y + token_idx*stride_col_y;
+        const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+
+        float tmp[c_rows_per_block] = {0.0f};
+
+        for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1);
+            const int kqs = vdr * (threadIdx.x % (qi/vdr));
+
+#pragma unroll
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            }
+        }
+
+#pragma unroll
+        for (int i = 0; i < c_rows_per_block; ++i) {
+            acc[i] += w * tmp[i];
+        }
+    }
+
+    ggml_cuda_pdl_lc();
+
+    // Warp-level reduction only - no shared memory needed
+#pragma unroll
+    for (int i = 0; i < c_rows_per_block; ++i) {
+        acc[i] = warp_reduce_sum<warp_size>(acc[i]);
+    }
+
+    if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+        dst[token_idx*stride_col_dst + row0 + threadIdx.x] = acc[threadIdx.x];
+    }
+}
+
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
@@ -906,6 +994,132 @@ static void mul_mat_vec_q_moe_launch(
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
             ncols_dst, ids_stride);
+    }
+}
+
+template <ggml_type type>
+static void mul_mat_vec_q_moe_reduce_launch(
+        const void * vx, const void * vy, const int32_t * ids, const float * x_scale, const float * token_weights, float * dst,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint32_t n_slots,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t ncols_dst, const uint32_t ids_stride,
+        const int warp_size, cudaStream_t stream) {
+
+    constexpr int rows_per_block = 2; // matches the tuned MoE kernel
+    const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
+    const dim3 block_nums(nblocks_rows, 1);
+    const dim3 block_dims(warp_size, ncols_dst);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if ((int) ncols_dst <= get_mmvq_mmid_perf_max_batch(type, cc)) {
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_reduce<type, rows_per_block>, launch_params,
+            vx, vy, ids, x_scale, token_weights, dst, ncols_x, nrows_x, n_slots,
+            stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y,
+            ncols_dst, ids_stride);
+    } else {
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe_reduce<type, rows_per_block, /*c_arch_max_bound=*/true>, launch_params,
+            vx, vy, ids, x_scale, token_weights, dst, ncols_x, nrows_x, n_slots,
+            stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y,
+            ncols_dst, ids_stride);
+    }
+}
+
+void ggml_cuda_mul_mat_vec_q_moe_reduce(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        const ggml_tensor * x_scale, const ggml_tensor * token_weights, ggml_tensor * dst,
+        const bool stage_reads) {
+    GGML_ASSERT(src0->buffer && ggml_is_quantized(src0->type));
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+    GGML_ASSERT( ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(token_weights->type == GGML_TYPE_F32 && ggml_is_contiguous(token_weights));
+    GGML_ASSERT(!x_scale || (x_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(x_scale) &&
+            ggml_nelements(x_scale) == src0->ne[2]));
+
+    const int64_t ne10 = src1->ne[0]; // reduction width
+    const int64_t ne11 = src1->ne[1]; // expert slots per token
+    const int64_t ne12 = src1->ne[2]; // tokens
+    const int64_t ne01 = src0->ne[1]; // output rows
+
+    GGML_ASSERT(src0->ne[0] == ne10);
+    GGML_ASSERT(ids->ne[0] == ne11 && ids->ne[1] == ne12);
+    GGML_ASSERT(ggml_nelements(token_weights) == ne11*ne12);
+    GGML_ASSERT(dst->ne[0] == ne01 && dst->ne[1] == ne12 && ggml_is_contiguous(dst));
+
+    cudaStream_t stream = ctx.stream();
+
+    // If src0 is a temporary compute buffer, clear any potential padding.
+    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        const size_t size_data  = ggml_nbytes(src0);
+        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+        if (size_alloc > size_data) {
+            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
+            GGML_ASSERT(!src0->view_src);
+            CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+        }
+    }
+
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne12*ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    {
+        const int64_t s11 = src1->nb[1] / ts_src1;
+        const int64_t s12 = src1->nb[2] / ts_src1;
+        const int64_t s13 = src1->nb[3] / ts_src1;
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), src0->type,
+                ne10, s11, s12, s13, ne10_padded, ne11, ne12, 1, stream);
+    }
+
+    const size_t ts_src0 = ggml_type_size(src0->type);
+    const int64_t s01  = src0->nb[1] / ts_src0;
+    const int64_t s02  = src0->nb[2] / ts_src0;
+    const int64_t s11q = ne10_padded / QK8_1;  // quantized per-slot stride
+    const int64_t s12q = ne11 * s11q;          // quantized per-token stride
+    const int64_t s1   = dst->nb[1] / sizeof(float);
+
+    int64_t ids_stride = ids->nb[1] / ggml_type_size(ids->type);
+
+    const auto & dev_info = ggml_cuda_info().devices[ggml_cuda_get_device()];
+    GGML_ASSERT(ne12 <= dev_info.max_threads_per_block / dev_info.warp_size);
+
+    const float * x_scale_d = x_scale ? (const float *) x_scale->data : nullptr;
+
+    // when dst's allocation aliases ids or the routing weights, read them
+    // through a staged copy: the kernel writes dst while other rows still
+    // read them (src1 needs no staging - its quantization above is the copy)
+    const int32_t * ids_d     = (const int32_t *) ids->data;
+    const float   * weights_d = (const float   *) token_weights->data;
+    ggml_cuda_pool_alloc<int32_t> ids_staged(ctx.pool());
+    ggml_cuda_pool_alloc<float>   weights_staged(ctx.pool());
+    if (stage_reads) {
+        ids_staged.alloc(ne11*ne12);
+        weights_staged.alloc(ne11*ne12);
+        CUDA_CHECK(cudaMemcpy2DAsync(ids_staged.ptr, ne11*sizeof(int32_t),
+                ids->data, ids->nb[1], ne11*sizeof(int32_t), ne12, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(weights_staged.ptr, token_weights->data,
+                ne11*ne12*sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        ids_d      = ids_staged.ptr;
+        weights_d  = weights_staged.ptr;
+        ids_stride = ne11;
+    }
+
+    switch (src0->type) {
+        case GGML_TYPE_Q8_0:
+            mul_mat_vec_q_moe_reduce_launch<GGML_TYPE_Q8_0>(
+                src0->data, src1_q8_1.get(), ids_d, x_scale_d, weights_d,
+                (float *) dst->data, ne10, ne01, ne11, s01, s12q, s1, s02, s11q, ne12, ids_stride,
+                dev_info.warp_size, stream);
+            break;
+        case GGML_TYPE_NVFP4:
+            mul_mat_vec_q_moe_reduce_launch<GGML_TYPE_NVFP4>(
+                src0->data, src1_q8_1.get(), ids_d, x_scale_d, weights_d,
+                (float *) dst->data, ne10, ne01, ne11, s01, s12q, s1, s02, s11q, ne12, ids_stride,
+                dev_info.warp_size, stream);
+            break;
+        default:
+            GGML_ABORT("unsupported type for fused MoE reduce: %s", ggml_type_name(src0->type));
     }
 }
 

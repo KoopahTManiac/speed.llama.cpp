@@ -3925,6 +3925,81 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
 
             if (!with_bias && ggml_cuda_should_fuse_mul_mat_vec_q_moe_scale(mm_node)) {
+                // the expert DOWN projection is followed by the routing-weight
+                // multiply and the expert-sum add tree; when the whole
+                // finalize sequence matches, fuse it into one deterministic
+                // launch (scale + weights + reduction in the kernel epilogue)
+                do {
+                    const int64_t n_used = ids->ne[0];
+                    if (n_used < 2 || (src0->type != GGML_TYPE_NVFP4 && src0->type != GGML_TYPE_Q8_0)) {
+                        break;
+                    }
+                    const int i_wmul = i + n_ops;
+                    const int n_all  = n_ops + 1 + (int) n_used + ((int) n_used - 1);
+                    if (i + n_all > cgraph->n_nodes) {
+                        break;
+                    }
+
+                    ggml_tensor * wmul = cgraph->nodes[i_wmul];
+                    if (wmul->op != GGML_OP_MUL ||
+                            (wmul->src[0] != out_node && wmul->src[1] != out_node)) {
+                        break;
+                    }
+                    const ggml_tensor * weights = wmul->src[0] == out_node ? wmul->src[1] : wmul->src[0];
+                    if (weights->type != GGML_TYPE_F32 || !ggml_is_contiguous(weights) ||
+                            weights->ne[0] != 1 || weights->ne[1] != n_used || weights->ne[2] != wmul->ne[2]) {
+                        break;
+                    }
+
+                    // slot views of the weighted output, then the add chain
+                    bool shape_ok = true;
+                    for (int64_t k = 0; k < n_used && shape_ok; ++k) {
+                        const ggml_tensor * v = cgraph->nodes[i_wmul + 1 + k];
+                        shape_ok = v->op == GGML_OP_VIEW && v->src[0] == wmul &&
+                                   v->view_offs == (size_t) k*wmul->nb[1];
+                    }
+                    for (int64_t k = 0; k < n_used - 1 && shape_ok; ++k) {
+                        const ggml_tensor * a = cgraph->nodes[i_wmul + 1 + n_used + k];
+                        const ggml_tensor * a_prev = k == 0 ? cgraph->nodes[i_wmul + 1]
+                                                            : cgraph->nodes[i_wmul + 1 + n_used + k - 1];
+                        shape_ok = a->op == GGML_OP_ADD && a->src[0] == a_prev &&
+                                   a->src[1] == cgraph->nodes[i_wmul + 1 + (k == 0 ? 1 : k + 1)];
+                    }
+                    if (!shape_ok) {
+                        break;
+                    }
+
+                    std::vector<ggml_op> all_ops(ops, ops + n_ops);
+                    all_ops.push_back(GGML_OP_MUL);
+                    all_ops.insert(all_ops.end(), n_used, GGML_OP_VIEW);
+                    all_ops.insert(all_ops.end(), n_used - 1, GGML_OP_ADD);
+                    const int out_idx[] = { i + n_all - 1 };
+                    if (!ggml_can_fuse_subgraph(cgraph, i, (int) all_ops.size(), all_ops.data(), out_idx, 1)) {
+                        break;
+                    }
+                    // src1 is staged through the q8 quantization buffer before
+                    // the kernel writes its output, so the output aliasing
+                    // src1 (common - the allocator reuses the freed GLU
+                    // buffer) is safe. ids and the routing weights are read
+                    // directly; when the output aliases them, the op stages
+                    // them into scratch (two tiny copies).
+                    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+                        const uintptr_t a0 = (uintptr_t) a->data, a1 = a0 + ggml_nbytes(a);
+                        const uintptr_t b0 = (uintptr_t) b->data, b1 = b0 + ggml_nbytes(b);
+                        return a0 < b1 && b0 < a1;
+                    };
+                    const ggml_tensor * out_t = cgraph->nodes[i + n_all - 1];
+                    const bool stage_reads = overlaps(out_t, ids) || overlaps(out_t, weights);
+
+                    ggml_cuda_mul_mat_vec_q_moe_reduce(*cuda_ctx, src0, src1, ids,
+                            scale, weights, cgraph->nodes[i + n_all - 1], stage_reads);
+                    fused_mul_mat_vec = true;
+                    fused_node_count  = n_all;
+                } while (false);
+                if (fused_mul_mat_vec) {
+                    break;
+                }
+
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;
