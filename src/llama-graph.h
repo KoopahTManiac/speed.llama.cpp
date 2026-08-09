@@ -750,13 +750,28 @@ public:
     // fill one column of the input tensors from a sequence's drafting config
     void fill_col(llama_seq_id seq_id, int64_t col, int64_t n_uniform_rows);
 
+    // whether any sequence of the ubatch has a sampled (temp > 0) config -
+    // decides between the greedy and sampled graph structures
+    static bool any_sampled(const std::map<llama_seq_id, llama_dspark_draft_sampling> * configs,
+            const llama_ubatch & ubatch);
+
     const std::map<llama_seq_id, llama_dspark_draft_sampling> * configs;
 
-    ggml_tensor * inp_uniform;   // F32 [n_uniform_rows, n_cols]
-    ggml_tensor * inp_inv_temp;  // F32 [1, n_cols]
-    ggml_tensor * inp_topk_mask; // F32 [n_cand, n_cols] additive (0 / -inf)
-    ggml_tensor * inp_top_p;     // F32 [1, n_cols]
-    ggml_tensor * inp_min_p;     // F32 [1, n_cols]
+    // the structure this graph was built with; a mismatch with the current
+    // configs invalidates reuse (see can_reuse). Instances built for the
+    // greedy structure carry no input tensors and act as pure witnesses.
+    bool built_sampled = false;
+
+    // inp_topk_mask, inp_top_p and inp_min_p are nullptr for consumers that
+    // sample without truncation (the draft's flat markov chain); the optional
+    // inp_sampled_flag (1.0 sampled / 0.0 greedy) lets such consumers blend
+    // a greedy argmax pick with the sampled pick per column.
+    ggml_tensor * inp_uniform;      // F32 [n_uniform_rows, n_cols]
+    ggml_tensor * inp_inv_temp;     // F32 [1, n_cols]
+    ggml_tensor * inp_topk_mask;    // F32 [n_cand, n_cols] additive (0 / -inf)
+    ggml_tensor * inp_top_p;        // F32 [1, n_cols]
+    ggml_tensor * inp_min_p;        // F32 [1, n_cols]
+    ggml_tensor * inp_sampled_flag = nullptr; // F32 [1, n_cols]
 
     // per-sequence RNG state, reseeded when the config's seed changes
     std::map<llama_seq_id, std::mt19937> rngs;
@@ -769,6 +784,7 @@ protected:
     std::vector<float> buf_topk_mask;
     std::vector<float> buf_top_p;
     std::vector<float> buf_min_p;
+    std::vector<float> buf_sampled_flag;
 
     void buf_resize(int64_t n_uniform_rows, int64_t n_cand, int64_t n_cols);
     void buf_flush();
@@ -1420,6 +1436,18 @@ struct llm_graph_context {
     // drafting config (res->t_verify_sampled). Active when the context enables
     // it (llama_set_spec_verify_sampling) and configs + capacity are set.
     void build_verify_sampling() const;
+
+    // pick one token per column of `logits` [n_vocab, n_cols] by inverse CDF
+    // over the full tempered distribution in natural vocab order - no
+    // candidate sorting (the same technique as the dist backend sampler).
+    // Used for draft proposals, which do not need truncation semantics:
+    // verification corrects any proposal. Returns the picked vocab index as
+    // F32 [1, n_cols].
+    ggml_tensor * build_dspark_sampled_pick_flat(
+            ggml_tensor * logits,
+            ggml_tensor * inp_uniform,  // [1, n_cols]
+            ggml_tensor * inp_inv_temp  // [1, n_cols]
+            ) const;
 
     //
     // dense (out)

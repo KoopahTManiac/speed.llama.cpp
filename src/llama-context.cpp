@@ -3823,6 +3823,10 @@ void llama_set_spec_verify_sampling(llama_context * ctx, bool value) {
     ctx->set_spec_verify_sampling(value);
 }
 
+uint32_t llama_get_dspark_draft_n_cand(const llama_context * ctx) {
+    return ctx->get_cparams().dspark_draft_n_cand;
+}
+
 llama_token llama_get_spec_verify_sampled_ith(llama_context * ctx, int32_t i) {
     return ctx->get_spec_verify_sampled_ith(i);
 }

@@ -144,6 +144,8 @@ LLAMA_API void llama_set_dspark_draft_sampling(
 // decode. 0 (default) disables the sampled chain: drafting is greedy.
 LLAMA_API void llama_set_dspark_draft_n_cand(struct llama_context * ctx, uint32_t n_cand);
 
+LLAMA_API uint32_t llama_get_dspark_draft_n_cand(const struct llama_context * ctx);
+
 // Speculative verify sampling: sample every output row of a decode in-graph
 // with the row's per-sequence config (same configs and capacity as above, set
 // on the TARGET context). The sampled ids are read with

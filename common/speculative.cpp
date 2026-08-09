@@ -2454,10 +2454,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK: {
-                // capacity of the draft's in-graph sampled chain, resolved by
-                // common_speculative_init_from_params (<= 0: greedy chain)
-                if (params.draft.dspark_n_cand > 0) {
-                    llama_set_dspark_draft_n_cand(params.draft.ctx_dft, (uint32_t) params.draft.dspark_n_cand);
+                // capacity of the draft's in-graph sampled chain: explicit, or the
+                // value common_speculative_init_from_params resolved onto the target
+                // context (callers may init from a different params object than the
+                // one that was resolved)
+                uint32_t n_cand = params.draft.dspark_n_cand > 0 ? (uint32_t) params.draft.dspark_n_cand : 0;
+                if (n_cand == 0 && params.draft.dspark_n_cand < 0 && params.draft.ctx_tgt != nullptr) {
+                    n_cand = llama_get_dspark_draft_n_cand(params.draft.ctx_tgt);
+                }
+                if (n_cand > 0) {
+                    llama_set_dspark_draft_n_cand(params.draft.ctx_dft, n_cand);
                 }
 
                 impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(
