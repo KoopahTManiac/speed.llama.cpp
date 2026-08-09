@@ -176,6 +176,13 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
             return false;
         }
 
+        // shallow rows at near-GEMV batch sizes stream too little per block
+        // to be efficient here (see the matching check in
+        // ggml_cuda_should_use_mmvf); the cuBLAS GEMV handles them best
+        if (src1_ncols <= 4 && src0_ne[0] <= 2*128*2) {
+            return false;
+        }
+
         if (GGML_CUDA_CC_IS_RDNA3_0(cc) && src1_ncols > 8) {
             return false;
         } else if (GGML_CUDA_CC_IS_CDNA2(cc) && (type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {

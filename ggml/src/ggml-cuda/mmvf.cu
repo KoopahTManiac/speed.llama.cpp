@@ -819,7 +819,13 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             return ne11 <= 8;
         case GGML_TYPE_F16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
-                const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                // rows shorter than two passes of the widest thread block
+                // (128 threads x 2-wide loads) leave each thread one
+                // vectorized load and the kernel runs latency bound -
+                // measured 0.5 TB/s on a [256 x 250k] low-rank projection
+                // vs 2.2 TB/s for the cuBLAS GEMV it falls back to
+                const bool deep_rows  = src0_ne[0] > 2*128*2;
+                const bool src0_small = deep_rows && (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 if (ampere_mma_available(cc)) {
                     return src0_small && ne11 == 1;
                 }
@@ -845,7 +851,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             return ne11 <= 8;
         case GGML_TYPE_BF16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
-                const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                // see the F16 case: shallow rows are latency bound in MMVF
+                const bool deep_rows  = src0_ne[0] > 2*128*2;
+                const bool src0_small = deep_rows && (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 if (ampere_mma_available(cc)) {
                     return src0_small && ne11 == 1;
                 }
