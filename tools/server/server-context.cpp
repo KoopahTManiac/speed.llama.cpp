@@ -19,9 +19,15 @@
 
 #include "../../src/llama-ext.h"
 
-// whether a request's sampler chain can be represented by the in-graph
-// speculative verify sampling (temp / top-k / top-p / min-p only)
-static bool spec_can_backend_verify(const common_params_sampling & sp) {
+// whether a request's sampler chain can be represented EXACTLY by the
+// in-graph speculative verify sampling (temp / top-k / top-p / min-p over the
+// candidate window): the request's top-k must fit the window, since sampling
+// with top-k disabled has support beyond it
+static bool spec_can_backend_verify(const common_params_sampling & sp, uint32_t n_cand) {
+    if (sp.temp > 0.0f && !(sp.top_k > 0 && (uint32_t) sp.top_k <= n_cand)) {
+        return false;
+    }
+
     return sp.penalty_repeat  == 1.0f &&
            sp.penalty_freq    == 0.0f &&
            sp.penalty_present == 0.0f &&
@@ -3917,7 +3923,7 @@ private:
                 // in-graph verify sampling fast path; requests whose sampler
                 // chain cannot run in-graph fall back to host sampling
                 std::vector<llama_token> accepted;
-                if (spec_can_backend_verify(slot.task->params.sampling)) {
+                if (spec_can_backend_verify(slot.task->params.sampling, llama_get_dspark_draft_n_cand(slot.ctx_tgt))) {
                     accepted = common_sampler_accept_n_backend(slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
                 if (accepted.empty()) {

@@ -3793,7 +3793,10 @@ ggml_tensor * llm_graph_context::build_dspark_sampled_pick(
 
     // fast top-k selection of the candidates (unordered), ordered afterwards
     // by a small sort of just the survivors - a full-vocab sort per pick is
-    // far more expensive than selection + an n_cand-wide sort
+    // far more expensive than selection + an n_cand-wide sort.
+    // note: backends without a large-row TOP_K implementation (e.g. CUDA
+    // builds without CCCL >= 3.2) schedule this op on the CPU - correct, but
+    // slow; such builds prefer the host sampling path anyway
     ggml_tensor * idx_u = ggml_top_k(ctx0, logits, (int) n_cand); // [n_cand, n_cols] I32, unordered
 
     // gather the candidate logits: lift indices to f32, add per-column vocab
@@ -3844,6 +3847,10 @@ ggml_tensor * llm_graph_context::build_dspark_sampled_pick(
     ggml_tensor * u   = ggml_mul(ctx0, inp_uniform, ggml_sum_rows(ctx0, probs));
     ggml_tensor * hit = ggml_step(ctx0, ggml_sub(ctx0, ggml_cumsum(ctx0, probs), u));
     ggml_tensor * pos = ggml_scale_bias(ctx0, ggml_sum_rows(ctx0, hit), -1.0f, (float) n_cand); // [1, n_cols]
+
+    // guard the fp edge where the uniform lands above the rounded kept mass,
+    // which would otherwise index one past the candidate set
+    pos = ggml_clamp(ctx0, pos, 0.0f, (float) (n_cand - 1));
 
     // resolve the selected candidate rank back to a vocab token id
     ggml_tensor * sel = ggml_reshape_1d(ctx0,
