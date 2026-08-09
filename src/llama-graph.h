@@ -1437,17 +1437,6 @@ struct llm_graph_context {
     // it (llama_set_spec_verify_sampling) and configs + capacity are set.
     void build_verify_sampling() const;
 
-    // pick one token per column of `logits` [n_vocab, n_cols] by inverse CDF
-    // over the full tempered distribution in natural vocab order - no
-    // candidate sorting (the same technique as the dist backend sampler).
-    // Used for draft proposals, which do not need truncation semantics:
-    // verification corrects any proposal. Returns the picked vocab index as
-    // F32 [1, n_cols].
-    ggml_tensor * build_dspark_sampled_pick_flat(
-            ggml_tensor * logits,
-            ggml_tensor * inp_uniform,  // [1, n_cols]
-            ggml_tensor * inp_inv_temp  // [1, n_cols]
-            ) const;
 
     //
     // dense (out)

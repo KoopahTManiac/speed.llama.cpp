@@ -3854,24 +3854,6 @@ ggml_tensor * llm_graph_context::build_dspark_sampled_pick(
     return ggml_reshape_1d(ctx0, ggml_cast(ctx0, tokf, GGML_TYPE_I32), n_cols);
 }
 
-ggml_tensor * llm_graph_context::build_dspark_sampled_pick_flat(
-        ggml_tensor * logits,
-        ggml_tensor * inp_uniform,
-        ggml_tensor * inp_inv_temp) const {
-    const int64_t n_vocab = logits->ne[0];
-
-    ggml_tensor * probs = ggml_soft_max(ctx0, ggml_mul(ctx0, logits, inp_inv_temp));
-
-    // inverse CDF in natural vocab order (the dist backend sampler's
-    // technique): the picked index is the vocab id itself, no candidate
-    // resolution needed. probs sums to 1, so the uniform needs no scaling.
-    ggml_tensor * hit = ggml_step(ctx0, ggml_sub(ctx0, ggml_cumsum(ctx0, probs), inp_uniform));
-    ggml_tensor * pos = ggml_scale_bias(ctx0, ggml_sum_rows(ctx0, hit), -1.0f, (float) n_vocab); // [1, n_cols]
-
-    // guard the fp edge where the uniform lands above the rounded total mass
-    return ggml_clamp(ctx0, pos, 0.0f, (float) (n_vocab - 1));
-}
-
 void llm_graph_context::build_verify_sampling() const {
     if (!cparams.spec_verify_sampling || dspark == nullptr || cparams.dspark_draft_n_cand == 0) {
         return;

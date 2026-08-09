@@ -266,7 +266,8 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     // (input values, see llm_graph_input_dspark_sampling). When every drafting
     // sequence is greedy, the chain is built greedy (argmax only) with a witness
     // input so a config switching to sampled invalidates the graph.
-    const bool feature_on    = g.cparams.dspark_draft_n_cand > 0 && g.dspark != nullptr;
+    const int64_t n_cand     = g.cparams.dspark_draft_n_cand;
+    const bool feature_on    = n_cand > 0 && g.dspark != nullptr;
     const bool sampled_chain = feature_on && llm_graph_input_dspark_sampling::any_sampled(g.dspark, g.ubatch);
 
     if (feature_on && !sampled_chain) {
@@ -274,29 +275,38 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
                 g.dspark, nullptr, nullptr, nullptr, nullptr, nullptr));
     }
 
-    // the draft's chain samples the full tempered distribution without
-    // truncation (proposals do not need it - verification corrects them),
-    // which avoids any candidate sorting. Greedy sequences are blended in
-    // per block via the sampled flag.
-    ggml_tensor * inp_uniform      = nullptr; // [block_drafts, n_blocks]
-    ggml_tensor * inp_inv_temp     = nullptr; // [1, n_blocks]
-    ggml_tensor * inp_sampled_flag = nullptr; // [1, n_blocks]
+    // the chain samples over the sorted candidate set with the request's
+    // truncation params; greedy sequences share the graph via uniform = 0
+    ggml_tensor * inp_uniform   = nullptr; // [block_drafts, n_blocks]
+    ggml_tensor * inp_inv_temp  = nullptr; // [1, n_blocks]
+    ggml_tensor * inp_topk_mask = nullptr; // [n_cand, n_blocks]
+    ggml_tensor * inp_top_p     = nullptr; // [1, n_blocks]
+    ggml_tensor * inp_min_p     = nullptr; // [1, n_blocks]
+
+    ggml_tensor * cand_offs  = nullptr; // [1, n_blocks]: j*n_cand,  for flat gathers
+    ggml_tensor * vocab_offs = nullptr; // [1, n_blocks]: j*n_vocab, for flat gathers
 
     if (sampled_chain) {
-        inp_uniform      = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, block_drafts, n_blocks);
-        inp_inv_temp     = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,            n_blocks);
-        inp_sampled_flag = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,            n_blocks);
+        inp_uniform   = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, block_drafts, n_blocks);
+        inp_inv_temp  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,            n_blocks);
+        inp_topk_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_cand,       n_blocks);
+        inp_top_p     = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,            n_blocks);
+        inp_min_p     = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,            n_blocks);
 
-        for (ggml_tensor * t : { inp_uniform, inp_inv_temp, inp_sampled_flag }) {
+        for (ggml_tensor * t : { inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p }) {
             ggml_set_input(t);
         }
 
         auto inp = std::make_unique<llm_graph_input_dspark_sampling>(
-                g.dspark, inp_uniform, inp_inv_temp, nullptr, nullptr, nullptr);
-        inp->inp_sampled_flag = inp_sampled_flag;
-        inp->built_sampled    = true;
+                g.dspark, inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p);
+        inp->built_sampled = true;
 
         res->add_input(std::move(inp));
+
+        ggml_tensor * blocks_iota = ggml_arange(ctx0, 0.0f, (float) n_blocks, 1.0f);
+
+        cand_offs  = ggml_reshape_2d(ctx0, ggml_scale(ctx0, blocks_iota, (float) n_cand),  1, n_blocks);
+        vocab_offs = ggml_reshape_2d(ctx0, ggml_scale(ctx0, blocks_iota, (float) n_vocab), 1, n_blocks);
     }
 
     // float-encoded vocab indices, used both to emit the chain's token ids through
@@ -331,26 +341,19 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
 
         // chain token at position i, batched over all blocks
-        ggml_tensor * tok  = nullptr; // [n_blocks] I32
-        ggml_tensor * tokf = nullptr; // [1, n_blocks] F32
+        ggml_tensor * tok = nullptr; // [n_blocks] I32
         if (!sampled_chain) {
-            tok  = ggml_argmax(ctx0, col);
-            tokf = ggml_get_rows(ctx0, iota, tok);
+            tok = ggml_argmax(ctx0, col);
         } else {
             // this position's uniforms across all blocks
             ggml_tensor * u = ggml_cont(ctx0, ggml_view_2d(ctx0, inp_uniform, 1, n_blocks,
                     inp_uniform->nb[1], i*inp_uniform->nb[0]));
 
-            ggml_tensor * pickf   = g.build_dspark_sampled_pick_flat(col, u, inp_inv_temp);
-            ggml_tensor * greedyf = ggml_get_rows(ctx0, iota, ggml_argmax(ctx0, col));
-
-            // per-block blend: sampled columns take the CDF pick, greedy
-            // columns the argmax
-            tokf = ggml_add(ctx0, ggml_mul(ctx0, pickf, inp_sampled_flag),
-                            ggml_mul(ctx0, greedyf, ggml_scale_bias(ctx0, inp_sampled_flag, -1.0f, 1.0f)));
-            tok  = ggml_reshape_1d(ctx0, ggml_cast(ctx0, tokf, GGML_TYPE_I32), n_blocks);
+            tok = g.build_dspark_sampled_pick(col,
+                    u, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p, iota, vocab_offs, cand_offs);
         }
 
+        ggml_tensor * tokf = ggml_get_rows(ctx0, iota, tok); // [1, n_blocks] F32
         cat_ids = cat_ids ? ggml_concat(ctx0, cat_ids, tokf, 1) : tokf;
 
         if (i + 1 < block_drafts) {
