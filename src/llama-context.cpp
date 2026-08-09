@@ -1204,6 +1204,23 @@ void llama_context::set_spec_verify_sampling(bool value) {
     }
 }
 
+bool llama_context::set_decode_embd_enc(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    // only the (non-DSV4) DFlash decoder implements the fused feature path
+    if (value && !(model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult == 0)) {
+        return false;
+    }
+
+    if (cparams.decode_embd_enc != value) {
+        cparams.decode_embd_enc = value;
+
+        sched_need_reserve = true;
+    }
+
+    return true;
+}
+
 llama_token llama_context::get_spec_verify_sampled_ith(int32_t i) {
     synchronize();
 
@@ -1761,7 +1778,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const int64_t n_vocab = vocab.n_tokens();
     const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
-    const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : hparams.n_embd_inp();
+    const bool    enc_embd = cparams.decode_embd_enc && batch_inp.embd;
+    const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() :
+                            enc_embd ? hparams.n_embd_inp_enc() : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -3825,6 +3844,10 @@ void llama_set_spec_verify_sampling(llama_context * ctx, bool value) {
 
 uint32_t llama_get_dspark_draft_n_cand(const llama_context * ctx) {
     return ctx->get_cparams().dspark_draft_n_cand;
+}
+
+bool llama_set_decode_embd_enc(llama_context * ctx, bool value) {
+    return ctx->set_decode_embd_enc(value);
 }
 
 llama_token llama_get_spec_verify_sampled_ith(llama_context * ctx, int32_t i) {

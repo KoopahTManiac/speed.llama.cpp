@@ -146,6 +146,13 @@ LLAMA_API void llama_set_dspark_draft_n_cand(struct llama_context * ctx, uint32_
 
 LLAMA_API uint32_t llama_get_dspark_draft_n_cand(const struct llama_context * ctx);
 
+// Make decode-path embd batches carry encoder-width rows (raw target
+// features): the decoder graph applies the feature-fusion projection
+// in-graph, so drivers submit one llama_decode instead of llama_encode +
+// readback + llama_decode. Returns false when the model's decoder does not
+// support the fused path (callers must then keep the two-call flow).
+LLAMA_API bool llama_set_decode_embd_enc(struct llama_context * ctx, bool value);
+
 // Speculative verify sampling: sample every output row of a decode in-graph
 // with the row's per-sequence config (same configs and capacity as above, set
 // on the TARGET context). The sampled ids are read with

@@ -414,15 +414,29 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // KV cache injection
     if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+        // with decode_embd_enc the rows are raw encoder-width target features
+        // and the feature-fusion projection runs here, fusing what previously
+        // required a separate encode call (see llama_set_decode_embd_enc)
+        const bool    fused_enc = cparams.decode_embd_enc;
+        const int64_t n_embd_in = fused_enc ? hparams.n_embd_inp_enc() : n_embd;
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_in);
+
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_in, n_tokens);
         ggml_set_input(inp->embd);
 
         ggml_tensor * inp_g = inp->embd;
         cb(inp_g, "inp_g_embeddings", -1);
 
         res->add_input(std::move(inp));
+
+        if (fused_enc) {
+            inp_g = build_lora_mm(model.fc, inp_g);
+            cb(inp_g, "fc_out", -1);
+
+            inp_g = build_norm(inp_g, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
+            cb(inp_g, "enc_norm_out", -1);
+        }
 
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];

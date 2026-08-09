@@ -933,6 +933,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
+    // the inject decode fuses the feature projection in-graph
+    // (llama_set_decode_embd_enc), replacing the encode + readback + decode flow
+    bool fused_inject = false;
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
@@ -984,8 +988,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
         }
 
-        batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
-        batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, n_seq);
+        // fused feature path: when supported, the inject decode consumes the raw
+        // encoder-width features directly (no separate encode call + readback)
+        fused_inject = llama_set_decode_embd_enc(ctx_dft, true);
+
+        batch        = llama_batch_init(llama_n_batch(ctx_dft), 0, n_seq);
+        batch_inject = llama_batch_init(llama_n_batch(ctx_dft), fused_inject ? n_embd_enc : n_embd_dec, n_seq);
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1082,30 +1090,40 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
-                // fuse extracted features through DFlash encoder
-                llama_batch enc_batch = {
-                    /*.n_tokens =*/ n_chunk,
-                    /*.token    =*/ nullptr,
-                    /*.embd     =*/ features_buf.data(),
-                    /*.pos      =*/ nullptr,
-                    /*.n_seq_id =*/ nullptr,
-                    /*.seq_id   =*/ nullptr,
-                    /*.logits   =*/ nullptr,
-                };
+                int32_t rc = 0;
 
-                int32_t rc = llama_encode(ctx_dft, enc_batch);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
+                batch_inject.n_tokens = n_chunk;
+
+                if (fused_inject) {
+                    // the inject decode fuses the features in-graph
+                    std::memcpy(batch_inject.embd, features_buf.data(), (size_t) n_chunk * n_embd_enc * sizeof(float));
+                } else {
+                    // fuse extracted features through the DFlash encoder, then
+                    // feed its output to the inject decode
+                    llama_batch enc_batch = {
+                        /*.n_tokens =*/ n_chunk,
+                        /*.token    =*/ nullptr,
+                        /*.embd     =*/ features_buf.data(),
+                        /*.pos      =*/ nullptr,
+                        /*.n_seq_id =*/ nullptr,
+                        /*.seq_id   =*/ nullptr,
+                        /*.logits   =*/ nullptr,
+                    };
+
+                    rc = llama_encode(ctx_dft, enc_batch);
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
+
+                    const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
+                    GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
+
+                    std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
                 }
 
-                const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
-
                 // inject the DFlash decoder K/V cache at the tokens' target positions
-                batch_inject.n_tokens = n_chunk;
-                std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
 
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     batch_inject.pos[i]       = batch_in.pos[i_batch_beg[seq_id] + offset + i];

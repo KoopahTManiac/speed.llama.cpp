@@ -32,6 +32,11 @@ struct llama_cparams {
     // drafting config (see build_verify_sampling); requires dspark_draft_n_cand
     bool spec_verify_sampling = false;
 
+    // decode-path embd batches carry encoder-width rows (raw target features);
+    // the decoder graph applies the feature-fusion projection in-graph, fusing
+    // what previously required a separate encode call (see llama-ext.h)
+    bool decode_embd_enc = false;
+
     float rope_freq_base;
     float rope_freq_scale;
 

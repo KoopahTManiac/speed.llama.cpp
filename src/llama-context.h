@@ -119,6 +119,7 @@ struct llama_context {
     void set_dspark_draft_sampling(llama_seq_id seq_id, llama_dspark_draft_sampling sampling);
     void set_dspark_draft_n_cand(uint32_t n_cand);
     void set_spec_verify_sampling(bool value);
+    bool set_decode_embd_enc(bool value);
 
     llama_token get_spec_verify_sampled_ith(int32_t i);
     void set_causal_attn(bool value);
