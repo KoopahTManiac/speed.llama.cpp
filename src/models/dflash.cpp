@@ -314,9 +314,17 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     // (vocab sizes fit exactly in f32's integer range)
     ggml_tensor * iota = ggml_reshape_2d(ctx0, ggml_arange(ctx0, 0.0f, (float) n_vocab, 1.0f), 1, n_vocab);
 
-    ggml_tensor * cat      = nullptr;
-    ggml_tensor * cat_conf = nullptr;
-    ggml_tensor * cat_ids  = nullptr;
+    // the proposal distribution feeds exact ratio acceptance; emitted only
+    // when the channel is wide enough to carry it
+    const bool emit_dist = sampled_chain &&
+            (int64_t) res->t_embd->ne[0] >= LLAMA_DSPARK_NEXTN_ROW_CAND + 2*n_cand;
+
+    ggml_tensor * cat        = nullptr;
+    ggml_tensor * cat_conf   = nullptr;
+    ggml_tensor * cat_ids    = nullptr;
+    ggml_tensor * cat_q      = nullptr;
+    ggml_tensor * cat_cand_q = nullptr;
+    ggml_tensor * cat_cand_i = nullptr;
 
     for (int64_t i = 0; i < block_drafts; ++i) {
         ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev);   // [R, n_blocks]
@@ -349,8 +357,16 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             ggml_tensor * u = ggml_cont(ctx0, ggml_view_2d(ctx0, inp_uniform, 1, n_blocks,
                     inp_uniform->nb[1], i*inp_uniform->nb[0]));
 
+            llm_graph_context::dspark_pick_dist dist;
             tok = g.build_dspark_sampled_pick(col,
-                    u, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p, iota, vocab_offs, cand_offs);
+                    u, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p, iota, vocab_offs, cand_offs,
+                    emit_dist ? &dist : nullptr);
+
+            if (emit_dist) {
+                cat_q      = cat_q      ? ggml_concat(ctx0, cat_q,      dist.q_chosen,  1) : dist.q_chosen;
+                cat_cand_q = cat_cand_q ? ggml_concat(ctx0, cat_cand_q, dist.cand_q,    1) : dist.cand_q;
+                cat_cand_i = cat_cand_i ? ggml_concat(ctx0, cat_cand_i, dist.cand_idsf, 1) : dist.cand_idsf;
+            }
         }
 
         ggml_tensor * tokf = ggml_get_rows(ctx0, iota, tok); // [1, n_blocks] F32
@@ -377,11 +393,26 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
         // pack through the n_embd-wide `llama_get_embeddings_nextn` channel
         // (row layout defined by LLAMA_DSPARK_NEXTN_ROW_* in llama-ext.h)
-        static_assert(LLAMA_DSPARK_NEXTN_ROW_CONF == 0 && LLAMA_DSPARK_NEXTN_ROW_TOKEN == 1,
+        static_assert(LLAMA_DSPARK_NEXTN_ROW_CONF == 0 && LLAMA_DSPARK_NEXTN_ROW_TOKEN == 1 &&
+                      LLAMA_DSPARK_NEXTN_ROW_Q == 2 && LLAMA_DSPARK_NEXTN_ROW_CAND == 3,
                       "row packing below must match the channel layout");
-        constexpr int64_t n_rows_used = LLAMA_DSPARK_NEXTN_ROW_TOKEN + 1;
 
-        ggml_tensor * xtra = ggml_concat(ctx0, conf, ids, 0); // [n_rows_used, n_tok]
+        ggml_tensor * xtra = ggml_concat(ctx0, conf, ids, 0);
+        int64_t n_rows_used = 2;
+
+        if (emit_dist) {
+            auto to_block_major = [&](ggml_tensor * t, int64_t nr) {
+                t = ggml_reshape_3d(ctx0, t, nr, n_blocks, block_drafts);
+                t = ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3));
+                return ggml_reshape_2d(ctx0, t, nr, n_tok);
+            };
+
+            xtra = ggml_concat(ctx0, xtra, to_block_major(cat_q,      1),      0);
+            xtra = ggml_concat(ctx0, xtra, to_block_major(cat_cand_q, n_cand), 0);
+            xtra = ggml_concat(ctx0, xtra, to_block_major(cat_cand_i, n_cand), 0);
+            n_rows_used = LLAMA_DSPARK_NEXTN_ROW_CAND + 2*n_cand;
+        }
+
         xtra = ggml_pad(ctx0, xtra, (int) (res->t_embd->ne[0] - n_rows_used), 0, 0, 0);
         res->t_h_nextn = xtra;
         ggml_build_forward_expand(g.gf, xtra);

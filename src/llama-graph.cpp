@@ -1297,7 +1297,8 @@ void llm_graph_input_dspark_sampling::fill_col(llama_seq_id seq_id, int64_t col,
 
     if (sampled) {
         if (const auto it = seeds.find(seq_id); it == seeds.end() || it->second != cfg.seed) {
-            rngs [seq_id] = std::mt19937(cfg.seed);
+            std::seed_seq ss{ cfg.seed, rng_role };
+            rngs [seq_id] = std::mt19937(ss);
             seeds[seq_id] = cfg.seed;
         }
     }
@@ -1399,17 +1400,70 @@ void llm_graph_input_spec_verify_sampling::set_input(const llama_ubatch * ubatch
 
     buf_resize(1, n_cand, n_rows);
 
+    std::vector<int32_t> dtok;
+    std::vector<float>   cand;
+    std::vector<float>   u2;
+    const bool ratio = inp_dtok != nullptr;
+    if (ratio) {
+        dtok.assign(n_rows, 0);
+        cand.assign(2 * n_cand * n_rows, 0.0f);
+        u2  .assign(n_rows, 0.0f);
+    }
+
     // one column per output row, configured by the row's sequence
+    std::map<llama_seq_id, uint32_t> pos_in_seq;
     int64_t row = 0;
     for (uint32_t i = 0; i < ubatch->n_tokens && row < n_rows; ++i) {
-        if (ubatch->output[i]) {
-            fill_col(ubatch->seq_id[i][0], row, 1);
-            row++;
+        if (!ubatch->output[i]) {
+            continue;
         }
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+
+        fill_col(seq_id, row, 1);
+
+        if (ratio) {
+            // the draft token evaluated at this row is the next token of the
+            // same sequence; the last row of a sequence feeds the bonus pick
+            if (i + 1 < ubatch->n_tokens && ubatch->seq_id[i + 1][0] == seq_id) {
+                dtok[row] = ubatch->token[i + 1];
+            }
+
+            const uint32_t pos = pos_in_seq[seq_id]++;
+            if (draft_dists != nullptr) {
+                if (const auto it = draft_dists->find(seq_id); it != draft_dists->end() &&
+                        pos < it->second.n_pos && it->second.n_cand == (uint32_t) n_cand) {
+                    const float * src = it->second.data.data() + (size_t) pos * 2 * n_cand;
+                    std::copy(src, src + 2*n_cand, cand.begin() + (size_t) row * 2 * n_cand);
+                }
+            }
+
+            // reuse the per-sequence rng for the residual pick
+            if (const auto rit = rngs.find(seq_id); rit != rngs.end()) {
+                std::uniform_real_distribution<double> dist(0.0, 1.0);
+                u2[row] = (float) dist(rit->second);
+            }
+        }
+
+        row++;
     }
     GGML_ASSERT(row == n_rows && "output-row count mismatch in verify sampling");
 
     buf_flush();
+
+    if (ratio) {
+        // cand carries [q x n_cand, ids x n_cand] per row; split to the tensors
+        std::vector<float> q  (n_cand * n_rows);
+        std::vector<float> ids(n_cand * n_rows);
+        for (int64_t r = 0; r < n_rows; ++r) {
+            std::copy(cand.begin() + r*2*n_cand,          cand.begin() + r*2*n_cand + n_cand,   q.begin() + r*n_cand);
+            std::copy(cand.begin() + r*2*n_cand + n_cand, cand.begin() + (r + 1)*2*n_cand,    ids.begin() + r*n_cand);
+        }
+
+        ggml_backend_tensor_set(inp_dtok,     dtok.data(), 0, dtok.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(inp_cand_q,      q.data(), 0,    q.size()*sizeof(float));
+        ggml_backend_tensor_set(inp_cand_ids,  ids.data(), 0,  ids.size()*sizeof(float));
+        ggml_backend_tensor_set(inp_u2,         u2.data(), 0,   u2.size()*sizeof(float));
+    }
 }
 
 //
@@ -1434,6 +1488,9 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+
+    t_verify_sampled = nullptr;
+    t_verify_ratio   = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1599,6 +1656,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     samplers         (params.samplers),
     dspark           (params.dspark),
+    draft_dists      (params.draft_dists),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -3784,7 +3842,8 @@ ggml_tensor * llm_graph_context::build_dspark_sampled_pick(
         ggml_tensor * inp_min_p,
         ggml_tensor * iota,
         ggml_tensor * vocab_offs,
-        ggml_tensor * cand_offs) const {
+        ggml_tensor * cand_offs,
+        dspark_pick_dist * dist) const {
     GGML_ASSERT(ggml_is_contiguous(logits));
 
     const int64_t n_vocab = logits->ne[0];
@@ -3858,6 +3917,16 @@ ggml_tensor * llm_graph_context::build_dspark_sampled_pick(
 
     ggml_tensor * tokf = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, idxf, 1, n_cand*n_cols), sel); // [1, n_cols] F32
 
+    if (dist != nullptr) {
+        // the proposal distribution: kept tempered probs, normalized
+        ggml_tensor * q = ggml_div(ctx0, probs, ggml_sum_rows(ctx0, probs)); // [n_cand, n_cols]
+
+        dist->cand_q    = q;
+        dist->cand_idsf = idxf;
+        dist->q_chosen  = ggml_reshape_2d(ctx0,
+                ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, ggml_cont(ctx0, q), 1, n_cand*n_cols), sel), 1, n_cols);
+    }
+
     return ggml_reshape_1d(ctx0, ggml_cast(ctx0, tokf, GGML_TYPE_I32), n_cols);
 }
 
@@ -3894,14 +3963,28 @@ void llm_graph_context::build_verify_sampling() const {
     ggml_tensor * inp_top_p     = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,      n_rows);
     ggml_tensor * inp_min_p     = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,      n_rows);
 
-    for (ggml_tensor * t : { inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p }) {
+    // ratio-acceptance inputs: the draft token at each row and the draft's
+    // proposal distribution over its candidates
+    ggml_tensor * inp_dtok     = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rows);
+    ggml_tensor * inp_cand_q   = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_cand, n_rows);
+    ggml_tensor * inp_cand_ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_cand, n_rows);
+    ggml_tensor * inp_u2       = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,      n_rows);
+
+    for (ggml_tensor * t : { inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p,
+                             inp_cand_q, inp_cand_ids, inp_u2 }) {
         ggml_set_input(t);
     }
+    ggml_set_input(inp_dtok);
 
     {
         auto inp = std::make_unique<llm_graph_input_spec_verify_sampling>(
                 dspark, inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p);
         inp->built_sampled = true;
+        inp->draft_dists   = draft_dists;
+        inp->inp_dtok      = inp_dtok;
+        inp->inp_cand_q    = inp_cand_q;
+        inp->inp_cand_ids  = inp_cand_ids;
+        inp->inp_u2        = inp_u2;
         res->add_input(std::move(inp));
     }
 
@@ -3911,11 +3994,55 @@ void llm_graph_context::build_verify_sampling() const {
     ggml_tensor * vocab_offs = ggml_reshape_2d(ctx0, ggml_scale(ctx0, rows_iota, (float) n_vocab), 1, n_rows);
     ggml_tensor * cand_offs  = ggml_reshape_2d(ctx0, ggml_scale(ctx0, rows_iota, (float) n_cand),  1, n_rows);
 
+    dspark_pick_dist tdist;
     ggml_tensor * ids = build_dspark_sampled_pick(res->t_logits,
-            inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p, iota, vocab_offs, cand_offs);
+            inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p, iota, vocab_offs, cand_offs,
+            &tdist);
 
     res->t_verify_sampled = ids;
     ggml_build_forward_expand(gf, ids);
+
+    // exact ratio acceptance: the served probability of each row's draft
+    // token, and an exact residual sample for rejection. Since the served
+    // distribution's support is within the target's candidate set, the
+    // residual max(0, p - q) lives there too - no full-vocabulary work.
+    {
+        ggml_tensor * p_norm = tdist.cand_q;    // [n_cand, n_rows] served probs
+        ggml_tensor * t_idsf = tdist.cand_idsf; // [n_cand, n_rows]
+
+        auto eq = [&](ggml_tensor * a, ggml_tensor * b) {
+            // 1 where |a - b| < 0.5 (ids are integer-valued floats)
+            return ggml_scale_bias(ctx0,
+                    ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_abs(ctx0, ggml_sub(ctx0, a, b)), 1.0f, -0.5f)),
+                    -1.0f, 1.0f);
+        };
+
+        // p(draft token) per row
+        ggml_tensor * dtokf  = ggml_get_rows(ctx0, iota, inp_dtok); // [1, n_rows]
+        ggml_tensor * p_at_d = ggml_sum_rows(ctx0, ggml_mul(ctx0, p_norm, eq(t_idsf, dtokf))); // [1, n_rows]
+
+        // q evaluated at the target's candidates: match ids across the two
+        // candidate sets ([n_cand_draft, n_cand_target, n_rows] equality)
+        ggml_tensor * t3   = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, t_idsf,       1, n_cand, n_rows), n_cand, n_cand, n_rows, 1);
+        ggml_tensor * d3   = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, inp_cand_ids, n_cand, 1, n_rows), n_cand, n_cand, n_rows, 1);
+        ggml_tensor * q3   = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, inp_cand_q,   n_cand, 1, n_rows), n_cand, n_cand, n_rows, 1);
+        ggml_tensor * q_at = ggml_reshape_2d(ctx0,
+                ggml_cont(ctx0, ggml_sum_rows(ctx0, ggml_mul(ctx0, q3, eq(t3, d3)))), n_cand, n_rows);
+
+        // residual distribution and its sample
+        ggml_tensor * r   = ggml_relu(ctx0, ggml_sub(ctx0, p_norm, q_at)); // [n_cand, n_rows]
+        ggml_tensor * ur  = ggml_mul(ctx0, inp_u2, ggml_sum_rows(ctx0, r));
+        ggml_tensor * hit = ggml_step(ctx0, ggml_sub(ctx0, ggml_cumsum(ctx0, r), ur));
+        ggml_tensor * pos = ggml_clamp(ctx0,
+                ggml_scale_bias(ctx0, ggml_sum_rows(ctx0, hit), -1.0f, (float) n_cand), 0.0f, (float) (n_cand - 1));
+
+        ggml_tensor * sel = ggml_reshape_1d(ctx0,
+                ggml_cast(ctx0, ggml_add(ctx0, pos, cand_offs), GGML_TYPE_I32), n_rows);
+        ggml_tensor * residualf = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, t_idsf, 1, n_cand*n_rows), sel); // [1, n_rows]
+
+        res->t_verify_ratio = ggml_concat(ctx0, p_at_d, residualf, 0); // [2, n_rows]
+        ggml_build_forward_expand(gf, res->t_verify_ratio);
+    }
 }
 
 void llm_graph_context::build_sampling() const {

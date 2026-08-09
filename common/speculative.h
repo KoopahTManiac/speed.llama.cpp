@@ -57,6 +57,13 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // out (optional): the drafting distribution's probability of each token in
+    // *result, filled by drafters that sample in-graph and forward their
+    // proposal distribution to the target context for exact ratio acceptance
+    // (currently DSpark). Left empty when unavailable - callers must then
+    // accept drafts by matching.
+    std::vector<float> * result_q = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

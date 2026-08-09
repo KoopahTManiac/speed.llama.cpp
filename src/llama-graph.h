@@ -773,7 +773,12 @@ public:
     ggml_tensor * inp_min_p;        // F32 [1, n_cols]
     ggml_tensor * inp_sampled_flag = nullptr; // F32 [1, n_cols]
 
-    // per-sequence RNG state, reseeded when the config's seed changes
+    // per-sequence RNG state, reseeded when the config's seed changes. The
+    // stream is derived from {seed, rng_role} so that the draft chain, the
+    // verifier and the caller's acceptance tests draw mutually independent
+    // uniforms from the same request seed (see llama_dspark_rng_role).
+    uint32_t rng_role = LLAMA_DSPARK_RNG_ROLE_CHAIN;
+
     std::map<llama_seq_id, std::mt19937> rngs;
     std::map<llama_seq_id, uint32_t>     seeds;
 
@@ -791,12 +796,31 @@ protected:
 };
 
 // same inputs, filled per verify output row instead of per drafting block:
-// each output row samples with its sequence's config
+// each output row samples with its sequence's config. Optionally carries the
+// ratio-acceptance inputs: the draft token evaluated at each row and the
+// draft's proposal distribution over its candidates.
 class llm_graph_input_spec_verify_sampling : public llm_graph_input_dspark_sampling {
 public:
-    using llm_graph_input_dspark_sampling::llm_graph_input_dspark_sampling;
+    llm_graph_input_spec_verify_sampling(
+            const std::map<llama_seq_id, llama_dspark_draft_sampling> * configs,
+            ggml_tensor * inp_uniform,
+            ggml_tensor * inp_inv_temp,
+            ggml_tensor * inp_topk_mask,
+            ggml_tensor * inp_top_p,
+            ggml_tensor * inp_min_p) :
+        llm_graph_input_dspark_sampling(configs,
+                inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p) {
+        rng_role = LLAMA_DSPARK_RNG_ROLE_VERIFY;
+    }
 
     void set_input(const llama_ubatch * ubatch) override;
+
+    const std::map<llama_seq_id, llama_spec_verify_draft_dist> * draft_dists = nullptr;
+
+    ggml_tensor * inp_dtok     = nullptr; // I32 [n_rows] draft token evaluated at each row
+    ggml_tensor * inp_cand_q   = nullptr; // F32 [n_cand, n_rows] draft proposal probs
+    ggml_tensor * inp_cand_ids = nullptr; // F32 [n_cand, n_rows] draft candidate ids
+    ggml_tensor * inp_u2       = nullptr; // F32 [1, n_rows] residual-pick uniforms
 };
 
 //
@@ -838,6 +862,10 @@ struct llm_graph_params {
     // pointer). Entries are graph-input values: they may change between decodes
     // without rebuilding the graph.
     const std::map<llama_seq_id, llama_dspark_draft_sampling> * dspark = nullptr;
+
+    // draft proposal distributions for ratio acceptance, same ownership and
+    // reuse semantics as `dspark`
+    const std::map<llama_seq_id, llama_spec_verify_draft_dist> * draft_dists = nullptr;
 
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
@@ -997,6 +1025,9 @@ public:
     // speculative verify: one sampled token per output row (see build_verify_sampling)
     ggml_tensor * t_verify_sampled = nullptr; // I32 [n_outputs]
 
+    // ratio-acceptance outputs per output row: [p_draft, residual_token(f32)]
+    ggml_tensor * t_verify_ratio = nullptr;   // F32 [2, n_outputs]
+
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
@@ -1082,7 +1113,8 @@ struct llm_graph_context {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
-    const std::map<llama_seq_id, llama_dspark_draft_sampling> * dspark;
+    const std::map<llama_seq_id, llama_dspark_draft_sampling>  * dspark;
+    const std::map<llama_seq_id, llama_spec_verify_draft_dist> * draft_dists;
 
     const llm_graph_cb & cb_func;
 
@@ -1415,10 +1447,19 @@ struct llm_graph_context {
 
     void build_sampling() const;
 
+    // outputs of the sampled pick beyond the picked token, used by exact
+    // ratio acceptance (all optional to compute)
+    struct dspark_pick_dist {
+        ggml_tensor * q_chosen  = nullptr; // [1, n_cols] proposal prob of the picked token
+        ggml_tensor * cand_q    = nullptr; // [n_cand, n_cols] normalized proposal probs
+        ggml_tensor * cand_idsf = nullptr; // [n_cand, n_cols] candidate vocab ids (f32)
+    };
+
     // pick one token per column of `logits` [n_vocab, n_cols] by inverse CDF
     // over the sorted top-n_cand candidates. Filters follow the default host
     // sampler order (top-k, top-p, min-p on untempered probabilities, then
-    // temperature); uniform = 0 degenerates to argmax. Returns [n_cols] I32.
+    // temperature); uniform = 0 degenerates to argmax. Returns [n_cols] I32;
+    // when `dist` is given, also produces the proposal distribution.
     // Shared by the DSpark draft's markov chain and speculative verify.
     ggml_tensor * build_dspark_sampled_pick(
             ggml_tensor * logits,
@@ -1429,7 +1470,8 @@ struct llm_graph_context {
             ggml_tensor * inp_min_p,     // [1, n_cols]
             ggml_tensor * iota,          // [1, n_vocab] f32 arange
             ggml_tensor * vocab_offs,    // [1, n_cols] col*n_vocab
-            ggml_tensor * cand_offs      // [1, n_cols] col*n_cand
+            ggml_tensor * cand_offs,     // [1, n_cols] col*n_cand
+            dspark_pick_dist * dist = nullptr
             ) const;
 
     // speculative verify: sample every output row in-graph with its sequence's

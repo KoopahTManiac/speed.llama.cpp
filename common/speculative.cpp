@@ -943,6 +943,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
 
+    // scratch buffer for one sequence's proposal distribution, position-major
+    // [q x n_cand, ids x n_cand] rows (see llama_set_spec_verify_draft_dist)
+    std::vector<float> dist_buf;
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq)
@@ -1218,6 +1222,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * xtra = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(xtra && "DSpark draft requires the nextn embeddings channel");
 
+                // when the chain sampled and the channel carries its proposal
+                // distribution, forward it to the target context so the verify
+                // graph can compute exact ratio acceptance for this draft
+                const uint32_t n_cand   = llama_get_dspark_draft_n_cand(ctx_dft);
+                const bool     has_dist = dp.temp > 0.0f && n_cand > 0 &&
+                        n_embd_dec >= LLAMA_DSPARK_NEXTN_ROW_CAND + 2*(int32_t) n_cand;
+
+                dist_buf.clear();
+                if (dp.result_q) {
+                    dp.result_q->clear();
+                }
+
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
                     const size_t row = (size_t) (beg + i) * n_embd_dec;
 
@@ -1227,8 +1243,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     const llama_token id = (llama_token) lroundf(xtra[row + LLAMA_DSPARK_NEXTN_ROW_TOKEN]);
 
+                    if (has_dist) {
+                        dist_buf.insert(dist_buf.end(),
+                                xtra + row + LLAMA_DSPARK_NEXTN_ROW_CAND,
+                                xtra + row + LLAMA_DSPARK_NEXTN_ROW_CAND + 2*n_cand);
+                        if (dp.result_q) {
+                            dp.result_q->push_back(xtra[row + LLAMA_DSPARK_NEXTN_ROW_Q]);
+                        }
+                    }
+
                     result.push_back(id);
                 }
+
+                if (result.size() < (size_t) params.n_min) {
+                    result.clear();
+                    dist_buf.clear();
+                    if (dp.result_q) {
+                        dp.result_q->clear();
+                    }
+                }
+
+                // forward this round's distribution - or clear a stale one
+                llama_set_spec_verify_draft_dist(this->params.ctx_tgt, seq_id,
+                        dist_buf.data(), has_dist ? (uint32_t) result.size() : 0, n_cand);
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
                 for (int32_t i = 1; i < n_block_tokens; ++i) {

@@ -1237,6 +1237,33 @@ llama_token llama_context::get_spec_verify_sampled_ith(int32_t i) {
     return spec_verify_sampled[row];
 }
 
+void llama_context::set_spec_verify_draft_dist(llama_seq_id seq_id, const float * data, uint32_t n_pos, uint32_t n_cand) {
+    auto & dist = spec_verify_draft_dists[seq_id];
+
+    dist.n_pos  = n_pos;
+    dist.n_cand = n_cand;
+    dist.data.assign(data, data + (size_t) n_pos * 2 * n_cand);
+}
+
+bool llama_context::get_spec_verify_ratio_ith(int32_t i, float * p_draft, llama_token * residual) {
+    synchronize();
+
+    if (i < 0 || (size_t) i >= output_ids.size()) {
+        return false;
+    }
+
+    const int64_t row = output_ids[i];
+
+    if (row < 0 || (size_t) (2*row + 1) >= spec_verify_ratio.size()) {
+        return false;
+    }
+
+    *p_draft  = spec_verify_ratio[2*row + 0];
+    *residual = (llama_token) lroundf(spec_verify_ratio[2*row + 1]);
+
+    return true;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1909,6 +1936,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_tokens_prev  = 0;
 
     spec_verify_sampled.clear();
+    spec_verify_ratio.clear();
 
     do {
         const auto & ubatch = mctx->get_ubatch();
@@ -2082,6 +2110,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
             spec_verify_sampled.resize(n_outputs_prev + n_outputs);
             ggml_backend_tensor_get_async(backend_v, res->t_verify_sampled,
                     spec_verify_sampled.data() + n_outputs_prev, 0, n_outputs*sizeof(llama_token));
+        }
+
+        // ratio-acceptance outputs: [p_draft, residual_token] per output row
+        if (res->t_verify_ratio && n_outputs > 0) {
+            ggml_backend_t backend_r = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_verify_ratio);
+            GGML_ASSERT(backend_r != nullptr);
+            GGML_ASSERT(res->t_verify_ratio->ne[1] >= n_outputs);
+
+            spec_verify_ratio.resize(2*(n_outputs_prev + n_outputs));
+            ggml_backend_tensor_get_async(backend_r, res->t_verify_ratio,
+                    spec_verify_ratio.data() + 2*n_outputs_prev, 0, 2*n_outputs*sizeof(float));
         }
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
@@ -2523,6 +2562,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.dspark      =*/ &dspark_draft_sampling,
+        /*.draft_dists =*/ &spec_verify_draft_dists,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -3852,6 +3892,14 @@ bool llama_set_decode_embd_enc(llama_context * ctx, bool value) {
 
 llama_token llama_get_spec_verify_sampled_ith(llama_context * ctx, int32_t i) {
     return ctx->get_spec_verify_sampled_ith(i);
+}
+
+void llama_set_spec_verify_draft_dist(llama_context * ctx, llama_seq_id seq_id, const float * data, uint32_t n_pos, uint32_t n_cand) {
+    ctx->set_spec_verify_draft_dist(seq_id, data, n_pos, n_cand);
+}
+
+bool llama_get_spec_verify_ratio_ith(llama_context * ctx, int32_t i, float * p_draft, llama_token * residual) {
+    return ctx->get_spec_verify_ratio_ith(i, p_draft, residual);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

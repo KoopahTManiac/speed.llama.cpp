@@ -238,6 +238,17 @@ struct server_slot {
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
 
+    // proposal probability of each spec_draft token, filled by drafters that
+    // support exact ratio acceptance (empty otherwise; see
+    // common_speculative_draft_params.result_q)
+    std::vector<float> spec_draft_q;
+
+    // drives the ratio-acceptance tests; seeded per task from the request
+    // seed with the ACCEPT role so its draws are independent of the draft's
+    // and the verifier's streams (see llama_dspark_rng_role)
+    std::mt19937 spec_rng;
+    bool spec_rng_seeded = false;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -371,8 +382,10 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_q.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            spec_rng_seeded = false;
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -3064,6 +3077,7 @@ private:
                             /* .seed     = */ slot.task->params.sampling.seed,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .result_q = */ &slot.spec_draft_q,
                         };
 
                         // mirror the request's sampling on the target for
@@ -3924,12 +3938,39 @@ private:
                 // chain cannot run in-graph fall back to host sampling
                 std::vector<llama_token> accepted;
                 if (spec_can_backend_verify(slot.task->params.sampling, llama_get_dspark_draft_n_cand(slot.ctx_tgt))) {
-                    accepted = common_sampler_accept_n_backend(slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    if (slot.spec_is_replay) {
+                        // replayed tokens already passed acceptance last round
+                        // (the checkpoint restore only rebuilt the context) -
+                        // they are exactly distributed, so re-testing them
+                        // against fresh verify samples would only truncate
+                        // valid tokens. Accept them all and take the bonus.
+                        const llama_token bonus = llama_get_spec_verify_sampled_ith(slot.ctx_tgt, slot.spec_i_batch.back());
+                        if (bonus >= 0) {
+                            accepted = slot.spec_draft;
+                            accepted.push_back(bonus);
+                        }
+                    } else if (slot.task->params.sampling.temp > 0.0f && slot.spec_draft_q.size() == n_draft) {
+                        // exact ratio acceptance (accept with min(1, p/q)):
+                        // higher acceptance than matching against the
+                        // verifier's own samples, and exactly the served
+                        // distribution
+                        if (!slot.spec_rng_seeded) {
+                            std::seed_seq ss{ slot.task->params.sampling.seed, (uint32_t) LLAMA_DSPARK_RNG_ROLE_ACCEPT };
+                            slot.spec_rng = std::mt19937(ss);
+                            slot.spec_rng_seeded = true;
+                        }
+                        accepted = common_sampler_accept_n_backend_ratio(
+                                slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q, slot.spec_rng);
+                    }
+                    if (accepted.empty()) {
+                        accepted = common_sampler_accept_n_backend(slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    }
                 }
                 if (accepted.empty()) {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
                 slot.spec_i_batch.clear();
+                slot.spec_draft_q.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
 

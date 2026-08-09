@@ -4,6 +4,7 @@
 
 #include "common.h"
 
+#include <random>
 #include <string>
 #include <vector>
 
@@ -95,6 +96,21 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // sampler chain is representable in-graph (temp / top-k / top-p / min-p; no
 // grammar, no stateful samplers) - the caller is responsible for checking.
 std::vector<llama_token> common_sampler_accept_n_backend(struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft);
+
+// exact ratio acceptance for drafts that provide their proposal probabilities
+// (llama_set_spec_verify_draft_dist): accept draft[i] with probability
+// min(1, p/q), emit the in-graph residual sample on the first rejection, the
+// in-graph bonus sample when everything is accepted. draft_q holds the
+// proposal probability of each draft token; rng drives the acceptance tests
+// and must be independent of the streams that produced the draft (seed it
+// with LLAMA_DSPARK_RNG_ROLE_ACCEPT, see llama_dspark_rng_role). Same
+// fall-back and eligibility contract as common_sampler_accept_n_backend.
+std::vector<llama_token> common_sampler_accept_n_backend_ratio(
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        const std::vector<float> & draft_q,
+        std::mt19937 & rng);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 

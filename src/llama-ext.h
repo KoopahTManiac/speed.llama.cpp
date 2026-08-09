@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <map>
+#include <vector>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -106,9 +107,15 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 
 // Row layout of the DSpark draft's nextn channel (see build_dspark_markov_head):
 // row 0 holds each drafted position's acceptance confidence, row 1 the chain's
-// chosen token id (float-encoded; vocab sizes fit exactly in f32's integer range).
+// chosen token id (float-encoded; vocab sizes fit exactly in f32's integer
+// range), row 2 the proposal probability of the chosen token, and - when the
+// channel is wide enough (n_embd >= 3 + 2*n_cand) - the proposal distribution
+// itself: n_cand normalized candidate probabilities followed by n_cand
+// candidate ids. The distribution feeds exact ratio acceptance.
 #define LLAMA_DSPARK_NEXTN_ROW_CONF  0
 #define LLAMA_DSPARK_NEXTN_ROW_TOKEN 1
+#define LLAMA_DSPARK_NEXTN_ROW_Q     2
+#define LLAMA_DSPARK_NEXTN_ROW_CAND  3
 
 // Per-sequence sampling configuration for the DSpark draft's markov chain,
 // mirroring the request's sampling parameters. temp <= 0 drafts greedily
@@ -128,6 +135,18 @@ struct llama_dspark_draft_sampling {
     float    min_p;
     int32_t  top_k;
     uint32_t seed;
+};
+
+// The request's seed drives several uniform streams: the draft chain's picks,
+// the target's verify picks and residual draws, and the caller's acceptance
+// tests. Exact ratio acceptance requires them to be mutually independent, so
+// each role seeds its generator through std::seed_seq{seed, role} instead of
+// the raw seed (identical raw-seeded streams would correlate the acceptance
+// draw with the proposal draw and bias the emitted distribution).
+enum llama_dspark_rng_role : uint32_t {
+    LLAMA_DSPARK_RNG_ROLE_CHAIN  = 0, // draft chain sampling
+    LLAMA_DSPARK_RNG_ROLE_VERIFY = 1, // target verify sampling + residual
+    LLAMA_DSPARK_RNG_ROLE_ACCEPT = 2, // caller's ratio-acceptance tests
 };
 
 // Configure the drafting distribution for one sequence of a DSpark draft
@@ -164,6 +183,35 @@ LLAMA_API void llama_set_spec_verify_sampling(struct llama_context * ctx, bool v
 // Returns the in-graph sampled token for output row i of the last decode, or
 // -1 when verify sampling was not active for that decode.
 LLAMA_API llama_token llama_get_spec_verify_sampled_ith(struct llama_context * ctx, int32_t i);
+
+// A draft's proposal distribution for one sequence's next verify decode:
+// n_pos positions, each with n_cand normalized candidate probabilities
+// followed by n_cand candidate ids (float-encoded), laid out position-major.
+struct llama_spec_verify_draft_dist {
+    uint32_t n_pos  = 0;
+    uint32_t n_cand = 0;
+    std::vector<float> data;
+};
+
+// Provide the draft's proposal distribution for the next verify decode of a
+// sequence. Enables exact ratio acceptance: the verify graph computes the
+// served probability of each draft token and an exact residual sample.
+LLAMA_API void llama_set_spec_verify_draft_dist(
+        struct llama_context * ctx,
+        llama_seq_id           seq_id,
+        const float          * data,
+        uint32_t               n_pos,
+        uint32_t               n_cand);
+
+// Returns ratio-acceptance outputs for output row i of the last decode:
+// *p_draft = the served probability of the draft token evaluated at that row,
+// *residual = the exact residual sample to emit when that row rejects.
+// Returns false when ratio outputs were not produced for that decode.
+LLAMA_API bool llama_get_spec_verify_ratio_ith(
+        struct llama_context * ctx,
+        int32_t                i,
+        float                * p_draft,
+        llama_token          * residual);
 
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);

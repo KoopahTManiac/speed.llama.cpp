@@ -730,6 +730,53 @@ std::vector<llama_token> common_sampler_accept_n_backend(struct llama_context * 
     return result;
 }
 
+std::vector<llama_token> common_sampler_accept_n_backend_ratio(
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        const std::vector<float> & draft_q,
+        std::mt19937 & rng) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must hold one proposal probability per draft token");
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+
+    for (size_t i = 0; i < draft.size(); i++) {
+        float       p_draft  = 0.0f;
+        llama_token residual = -1;
+
+        if (!llama_get_spec_verify_ratio_ith(ctx, idxs[i], &p_draft, &residual) || residual < 0) {
+            return {};
+        }
+
+        // accept with probability min(1, p/q); the residual token is an exact
+        // sample of max(0, p - q), so the emitted sequence follows the served
+        // distribution regardless of how the draft proposed (speculative
+        // sampling, Leviathan et al. 2023)
+        if (dist(rng) * (double) draft_q[i] < (double) p_draft) {
+            result.push_back(draft[i]);
+            continue;
+        }
+
+        result.push_back(residual);
+        return result;
+    }
+
+    // every draft token accepted - the bonus token is the row past the last draft
+    const llama_token id = llama_get_spec_verify_sampled_ith(ctx, idxs[draft.size()]);
+
+    if (id < 0) {
+        return {};
+    }
+
+    result.push_back(id);
+
+    return result;
+}
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
 }

@@ -120,8 +120,10 @@ struct llama_context {
     void set_dspark_draft_n_cand(uint32_t n_cand);
     void set_spec_verify_sampling(bool value);
     bool set_decode_embd_enc(bool value);
+    void set_spec_verify_draft_dist(llama_seq_id seq_id, const float * data, uint32_t n_pos, uint32_t n_cand);
 
     llama_token get_spec_verify_sampled_ith(int32_t i);
+    bool get_spec_verify_ratio_ith(int32_t i, float * p_draft, llama_token * residual);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -337,6 +339,14 @@ private:
     // in-graph sampled token per output row of the last decode (speculative
     // verify, see build_verify_sampling); empty when inactive
     std::vector<llama_token> spec_verify_sampled;
+
+    // ratio-acceptance outputs per output row of the last decode:
+    // [p_draft, residual_token(f32)] pairs; empty when inactive
+    std::vector<float> spec_verify_ratio;
+
+    // per-sequence draft proposal distributions for the next verify decode;
+    // consumed as graph-input values, stable address like dspark_draft_sampling
+    std::map<llama_seq_id, llama_spec_verify_draft_dist> spec_verify_draft_dists;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
