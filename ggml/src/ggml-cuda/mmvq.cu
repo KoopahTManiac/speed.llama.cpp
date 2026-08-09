@@ -725,12 +725,16 @@ static __global__ void mul_mat_vec_q(
 // Instantiated with two block-size bounds: the tuned per-arch+type bound for
 // the common batch sizes, and the architectural limit for larger batches
 // (whose only alternative is the synchronizing generic fallback).
-template <ggml_type type, int c_rows_per_block, bool c_arch_max_bound = false>
+// With c_has_scale, each output is multiplied by its expert's global weight
+// scale (x_scale_ptr[expert]) - the fused form of the per-expert scale
+// multiply that NVFP4 models apply after every MUL_MAT_ID.
+template <ggml_type type, int c_rows_per_block, bool c_has_scale = false, bool c_arch_max_bound = false>
 __launch_bounds__(c_arch_max_bound
         ? GGML_CUDA_ARCH_MAX_THREADS_PER_BLOCK
         : get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr,
+        const float * x_scale_ptr,
         float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
@@ -763,6 +767,12 @@ static __global__ void mul_mat_vec_q_moe(
     const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
+    // load early to hide the latency behind the dot products
+    [[maybe_unused]] float x_scale = 1.0f;
+    if constexpr (c_has_scale) {
+        x_scale = x_scale_ptr[channel_x];
+    }
+
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
 
@@ -789,7 +799,11 @@ static __global__ void mul_mat_vec_q_moe(
 
     // Write results
     if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
-        dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = tmp[threadIdx.x];
+        float result = tmp[threadIdx.x];
+        if constexpr (c_has_scale) {
+            result *= x_scale;
+        }
+        dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = result;
     }
 }
 
@@ -839,7 +853,7 @@ static void mul_mat_vec_q_switch_fusion(
 
 template <ggml_type type>
 static void mul_mat_vec_q_moe_launch(
-        const void * vx, const void * vy, const int32_t * ids, float * dst,
+        const void * vx, const void * vy, const int32_t * ids, const float * x_scale, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
@@ -856,15 +870,39 @@ static void mul_mat_vec_q_moe_launch(
     // larger batches (bounded by launch geometry, see get_mmvq_mmid_max_batch)
     // use the architectural-limit instantiation
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if ((int) ncols_dst <= get_mmvq_mmid_perf_max_batch(type, cc)) {
+    const bool perf_bound = (int) ncols_dst <= get_mmvq_mmid_perf_max_batch(type, cc);
+
+    if (x_scale != nullptr) {
+        // per-expert output scales are an NVFP4 concept (global weight scale);
+        // gating the instantiation keeps the other types' compile time down
+        if constexpr (type == GGML_TYPE_NVFP4) {
+            if (perf_bound) {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, /*c_has_scale=*/true>, launch_params,
+                    vx, vy, ids, x_scale, dst, ncols_x, nchannels_y, nrows_x,
+                    stride_row_x, stride_col_y, stride_col_dst,
+                    stride_channel_x, stride_channel_y, stride_channel_dst,
+                    ncols_dst, ids_stride);
+            } else {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, /*c_has_scale=*/true, /*c_arch_max_bound=*/true>, launch_params,
+                    vx, vy, ids, x_scale, dst, ncols_x, nchannels_y, nrows_x,
+                    stride_row_x, stride_col_y, stride_col_dst,
+                    stride_channel_x, stride_channel_y, stride_channel_dst,
+                    ncols_dst, ids_stride);
+            }
+            return;
+        }
+        GGML_ABORT("per-expert scale fusion requires NVFP4 weights");
+    }
+
+    if (perf_bound) {
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block>, launch_params,
-            vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
+            vx, vy, ids, nullptr, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
             ncols_dst, ids_stride);
     } else {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, /*c_arch_max_bound=*/true>, launch_params,
-            vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, /*c_has_scale=*/false, /*c_arch_max_bound=*/true>, launch_params,
+            vx, vy, ids, nullptr, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
             ncols_dst, ids_stride);
@@ -944,9 +982,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
     };
 
     if (has_ids && ncols_dst > 1) {
-        // Multi-token MUL_MAT_ID path - dedicated MoE kernel
+        // Multi-token MUL_MAT_ID path - dedicated MoE kernel. Of the fusion
+        // forms it supports only the per-expert output scale.
+        GGML_ASSERT(fusion.gate == nullptr && fusion.x_bias == nullptr &&
+                fusion.gate_bias == nullptr && fusion.gate_scale == nullptr);
         mul_mat_vec_q_moe_launch<type>(
-            vx, vy, ids, dst, ncols_x, nchannels_y_fd, nrows_x,
+            vx, vy, ids, (const float *) fusion.x_scale, dst, ncols_x, nchannels_y_fd, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
             ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
@@ -1225,7 +1266,10 @@ void ggml_cuda_mul_mat_vec_q(
     ggml_cuda_mm_fusion_args_device fusion_local{};
 
     if (fusion) {
-        GGML_ASSERT( !ids || dst->ne[2] == 1);
+        // the multi-token MoE kernel supports only the per-expert scale form
+        const bool scale_only = fusion->gate == nullptr && fusion->x_bias == nullptr &&
+                fusion->gate_bias == nullptr && fusion->gate_scale == nullptr;
+        GGML_ASSERT( !ids || dst->ne[2] == 1 || scale_only);
         GGML_ASSERT(  ids || dst->ne[1] == 1);
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b

@@ -1591,7 +1591,26 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 
 // -------------------------------------------------------------------------------------------------------------------------
 
+// src1 activations pre-quantized to the MMQ layout of a weight type, shared
+// by a run of matrix multiplications with the same src1 (see the shared-src1
+// run fusion in ggml_cuda_try_fuse)
+struct ggml_cuda_mmq_src1_q {
+    const char  * data;
+    const float * scales; // per-channel global scales; only for native-fp4 weight types
+};
+
+// whether the MMQ layout for this weight type carries per-channel scales
+bool ggml_cuda_mmq_src1_q_has_scales(ggml_type type_src0, int cc);
+
+// buffer size for pre-quantized src1, sized for either row-count fallback variant
+size_t ggml_cuda_mmq_src1_q_size(ggml_type type_src0, int cc, int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13);
+
+// quantize src1 into dst_data/dst_scales with the MMQ layout of type_src0
+void ggml_cuda_mmq_quantize_src1(ggml_backend_cuda_context & ctx,
+        ggml_type type_src0, const ggml_tensor * src1, char * dst_data, float * dst_scales);
+
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_cuda_mmq_src1_q * src1_q = nullptr);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);

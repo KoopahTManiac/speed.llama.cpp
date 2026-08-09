@@ -1811,6 +1811,34 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+// multi-token MUL_MAT_ID routed to the dedicated MoE kernel, which can fuse
+// the per-expert output scale (the NVFP4 global weight scale) - the form
+// ggml_cuda_should_fuse_mul_mat_vec_q rejects because it requires ne2 == 1
+static bool ggml_cuda_should_fuse_mul_mat_vec_q_moe_scale(const ggml_tensor * tensor) {
+    if (tensor->op != GGML_OP_MUL_MAT_ID || tensor->ne[2] <= 1) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = tensor->src[0];
+    const ggml_tensor * src1 = tensor->src[1];
+
+    if (src0->type != GGML_TYPE_NVFP4 || src1->type != GGML_TYPE_F32 || tensor->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                                   ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+                                   src0->view_src;
+    if (bad_padding_clear) {
+        return false;
+    }
+
+    // mirror the ggml_cuda_mul_mat_id dispatch: this shape must reach the
+    // runtime-sized MoE kernel
+    const auto & dev_info = ggml_cuda_info().devices[ggml_cuda_get_device()];
+    return tensor->ne[2] <= get_mmvq_mmid_max_batch(src0->type, dev_info);
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1865,6 +1893,46 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+}
+
+// mirror of ggml_cuda_mul_mat's dispatch chain: true when a MUL_MAT node
+// routes to the MMQ implementation. Used by the shared-src1 run fusion in
+// ggml_cuda_try_fuse - keep in sync with ggml_cuda_mul_mat above.
+static bool ggml_cuda_mul_mat_routes_to_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+    if (src0->buffer == nullptr) {
+        return false;
+    }
+
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+    const int64_t ne11 = src1->ne[1];
+
+    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+        return false;
+    }
+    if (src0->ne[1] == 1 && ne11 > MMVF_MAX_BATCH_SIZE) {
+        return false; // may take the transposed-vector path
+    }
+    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+        return false;
+    }
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+        return false;
+    }
+    return ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0);
 }
 
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -3850,6 +3918,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fused_node_count  = n_ops;
                 break;
             }
+
+            if (!with_bias && ggml_cuda_should_fuse_mul_mat_vec_q_moe_scale(mm_node)) {
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
+                fused_mul_mat_vec = true;
+                fused_node_count  = n_ops;
+                break;
+            }
         }
         if (fused_mul_mat_vec) {
             break;
@@ -3966,6 +4041,87 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
         return 2;
+    }
+
+    // Runs of MMQ matrix multiplications sharing one activation tensor (q/k/v
+    // projections, GDN input projections): quantize the activation once for
+    // the whole run instead of once per matmul. Every node in the run window
+    // still executes in its original order - matmuls with the shared
+    // quantized activation, their per-tensor scale multiplies through the
+    // regular dispatch - so evaluation semantics are unchanged. Only
+    // view-family nodes and the matmuls' own scale multiplies may appear in
+    // the window, which keeps runs from swallowing other fusion patterns.
+    if (node->op == GGML_OP_MUL_MAT && node->src[2] == nullptr &&
+            ggml_cuda_mul_mat_routes_to_mmq(*cuda_ctx, node)) {
+        const ggml_tensor * src1  = node->src[1];
+        const ggml_type     type0 = node->src[0]->type;
+
+        // bounded scan: a run in practice spans a handful of nodes (matmul +
+        // scale pairs with reshapes between); the cap only limits scanning
+        const int j_max = std::min(cgraph->n_nodes, i + 32);
+
+        int n_mm  = 0; // matmuls collected
+        int i_end = i; // last node belonging to the run
+        for (int j = i; j < j_max; ++j) {
+            ggml_tensor * cand = cgraph->nodes[j];
+
+            if (cand->op == GGML_OP_MUL_MAT) {
+                if (cand->src[1] != src1 || cand->src[2] != nullptr || cand->src[0]->type != type0 ||
+                        !ggml_cuda_mul_mat_routes_to_mmq(*cuda_ctx, cand)) {
+                    break;
+                }
+                n_mm++;
+                i_end = j;
+
+                // absorb the weight's global-scale multiply if it directly follows
+                if (j + 1 < cgraph->n_nodes && cgraph->nodes[j + 1]->op == GGML_OP_MUL &&
+                        get_mul_mat_scale(cgraph->nodes[j + 1], cand)) {
+                    j++;
+                    i_end = j;
+                }
+                continue;
+            }
+
+            if (ggml_cuda_is_view_or_noop(cand)) {
+                continue; // free to cross, but only included if another matmul follows
+            }
+
+            break;
+        }
+
+        if (n_mm >= 2) {
+            const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+
+            ggml_cuda_pool_alloc<char>  buf_q(cuda_ctx->pool(),
+                    ggml_cuda_mmq_src1_q_size(type0, cc, src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]));
+            ggml_cuda_pool_alloc<float> buf_scales(cuda_ctx->pool());
+            if (ggml_cuda_mmq_src1_q_has_scales(type0, cc)) {
+                buf_scales.alloc(src1->ne[3]*src1->ne[2]*src1->ne[1]);
+            }
+
+            ggml_cuda_mmq_quantize_src1(*cuda_ctx, type0, src1, buf_q.get(), buf_scales.ptr);
+
+            const ggml_cuda_mmq_src1_q src1_q = { buf_q.get(), buf_scales.ptr };
+
+            for (int j = i; j <= i_end; ++j) {
+                ggml_tensor * t = cgraph->nodes[j];
+                if (ggml_cuda_is_view_or_noop(t)) {
+                    continue;
+                }
+                if (t->op == GGML_OP_MUL_MAT) {
+                    ggml_cuda_mul_mat_q(*cuda_ctx, t->src[0], t->src[1], nullptr, t, &src1_q);
+                } else {
+                    const bool ok = ggml_cuda_compute_forward(*cuda_ctx, t);
+                    GGML_ASSERT(ok && "failed to execute node inside a shared-src1 MMQ run");
+                }
+            }
+
+#ifdef GGML_CUDA_DEBUG
+            GGML_LOG_INFO("%s: fused %d MMQ matmuls sharing activation %s (skipped %d nodes)\n",
+                          __func__, n_mm, src1->name, i_end - i);
+#endif
+            return i_end - i;
+        }
     }
 
     return 0;
