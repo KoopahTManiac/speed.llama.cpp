@@ -166,6 +166,16 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
             return false;
         }
     } else {
+        // MMF launches one block per rows_per_block rows; a small row count
+        // (e.g. a 256-row MoE router) at multi-token batch sizes then runs a
+        // handful of blocks on an otherwise idle device and is latency bound.
+        // Below a quarter of the SMs, prefer the cuBLAS path whose split-K
+        // schedule fills the device.
+        const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+        if (src1_ncols > 1 && src0_ne[1] / mmf_get_rows_per_block(cc) < nsm/4) {
+            return false;
+        }
+
         if (GGML_CUDA_CC_IS_RDNA3_0(cc) && src1_ncols > 8) {
             return false;
         } else if (GGML_CUDA_CC_IS_CDNA2(cc) && (type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
