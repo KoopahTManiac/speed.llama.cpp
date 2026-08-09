@@ -310,6 +310,8 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
 
+        info.devices[id].max_threads_per_block = prop.maxThreadsPerBlock;
+
 #ifndef GGML_USE_MUSA
         int supports_coop_launch = 0;
         CUDA_CHECK(cudaDeviceGetAttribute(&supports_coop_launch, cudaDevAttrCooperativeLaunch, physical_id));
@@ -1875,23 +1877,25 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const auto & dev_info = ggml_cuda_info().devices[ggml_cuda_get_device()];
+    const int cc = dev_info.cc;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type)) {
-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
-                if (ne2 <= mmvq_mmid_max) {
-                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
-                    return;
-                }
-            } else {
-                if (GGML_CUDA_CC_IS_AMD(cc)) {
-                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
-                    return;
-                }
+        if (ggml_is_quantized(src0->type)) {
+            // the runtime-sized MoE kernel extends past the templated kernels'
+            // limit (see get_mmvq_mmid_max_batch), avoiding the synchronizing
+            // fallback below for any batch it can launch
+            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, dev_info);
+            if (ne2 <= mmvq_mmid_max) {
+                ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                return;
+            }
+        } else if (ne2 <= MMVF_MAX_BATCH_SIZE) {
+            if (GGML_CUDA_CC_IS_AMD(cc)) {
+                ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+                return;
             }
         }
 
@@ -2521,8 +2525,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
-            const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
+            const auto & dev_info = ggml_cuda_info().devices[ggml_cuda_get_device()];
+            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, dev_info);
             if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance

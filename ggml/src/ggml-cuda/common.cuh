@@ -177,6 +177,12 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 
 #define GGML_CUDA_MAX_STREAMS 8
 
+// architectural limit on threads per block, needed where a compile-time bound
+// is required (e.g. __launch_bounds__); every CUDA and HIP architecture the
+// compilers can target shares this value. Runtime code should use the queried
+// ggml_cuda_info().devices[].max_threads_per_block instead.
+#define GGML_CUDA_ARCH_MAX_THREADS_PER_BLOCK 1024
+
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg);
 
@@ -1148,6 +1154,7 @@ struct ggml_cuda_device_info {
         size_t  vmm_granularity;                // granularity of virtual memory
         size_t  total_vram;
         int     warp_size;                      // Number of threads in a dispatch
+        int     max_threads_per_block;          // max. number of threads per block
         bool    supports_cooperative_launch;    // whether cooperative launch is supported
         int     physical_device;                // backing physical CUDA device for this (virtual) device
         int     physical_share_count;           // number of (virtual) devices sharing this device's physical GPU

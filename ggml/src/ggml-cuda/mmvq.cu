@@ -246,7 +246,9 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 }
 
 // Host function: returns the max batch size for the current arch+type at runtime.
-int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+// kernel-time crossover of the templated MMVQ kernels vs the alternatives,
+// tuned per type and architecture
+static int get_mmvq_mmid_perf_max_batch(ggml_type type, int cc) {
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
@@ -277,6 +279,22 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
         }
     }
     return MMVQ_MAX_BATCH_SIZE;
+}
+
+int get_mmvq_mmid_max_batch(ggml_type type, const ggml_cuda_device_info::cuda_device_info & device) {
+    const int perf_max = get_mmvq_mmid_perf_max_batch(type, device.cc);
+
+    if (perf_max < MMVQ_MAX_BATCH_SIZE) {
+        // type-specific tuned crossover
+        return perf_max;
+    }
+
+    // The MUL_MAT_ID MoE kernel takes the batch size at runtime, so beyond the
+    // templated kernels' limit it is bounded only by launch geometry (one warp
+    // per batch column). The only alternative for these batch sizes is the
+    // generic fallback, which synchronizes the stream per call and prevents
+    // CUDA graph capture, so prefer the MoE kernel for any batch it can launch.
+    return device.max_threads_per_block / device.warp_size;
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
@@ -704,8 +722,13 @@ static __global__ void mul_mat_vec_q(
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
-template <ggml_type type, int c_rows_per_block>
-__launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
+// Instantiated with two block-size bounds: the tuned per-arch+type bound for
+// the common batch sizes, and the architectural limit for larger batches
+// (whose only alternative is the synchronizing generic fallback).
+template <ggml_type type, int c_rows_per_block, bool c_arch_max_bound = false>
+__launch_bounds__(c_arch_max_bound
+        ? GGML_CUDA_ARCH_MAX_THREADS_PER_BLOCK
+        : get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr,
         float * dst_ptr,
@@ -829,11 +852,23 @@ static void mul_mat_vec_q_moe_launch(
     const dim3 block_dims(warp_size, ncols_dst);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
 
-    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block>, launch_params,
-        vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
-        stride_row_x, stride_col_y, stride_col_dst,
-        stride_channel_x, stride_channel_y, stride_channel_dst,
-        ncols_dst, ids_stride);
+    // batches within the tuned bound use the tightly-bounded instantiation;
+    // larger batches (bounded by launch geometry, see get_mmvq_mmid_max_batch)
+    // use the architectural-limit instantiation
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if ((int) ncols_dst <= get_mmvq_mmid_perf_max_batch(type, cc)) {
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block>, launch_params,
+            vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst,
+            ncols_dst, ids_stride);
+    } else {
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, /*c_arch_max_bound=*/true>, launch_params,
+            vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst,
+            ncols_dst, ids_stride);
+    }
 }
 
 template <ggml_type type>
@@ -847,18 +882,24 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int ids_stride, cudaStream_t stream) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
-    GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
 
     const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
     const uint3 sample_ratio_fd  = init_fastdiv_values(nsamples_dst  / nsamples_x);
 
     const int device = ggml_cuda_get_device();
-    const int                     cc        = ggml_cuda_info().devices[device].cc;
-    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const auto & dev_info = ggml_cuda_info().devices[device];
+    const int                     cc        = dev_info.cc;
+    const int warp_size = dev_info.warp_size;
     const mmvq_parameter_table_id table_id  = get_device_table_id(cc);
 
     const bool has_ids = ids != nullptr;
+
+    // the runtime-sized MoE kernel (ids path) is bounded by launch geometry;
+    // the templated kernels by their instantiation limit
+    GGML_ASSERT(ncols_dst <= (has_ids && ncols_dst > 1
+            ? (int64_t) dev_info.max_threads_per_block / warp_size
+            : (int64_t) MMVQ_MAX_BATCH_SIZE));
 
     const auto should_use_small_k = [&](int c_ncols_dst) {
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
@@ -1170,7 +1211,12 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
-    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+    {
+        // the ids path dispatches to the runtime-sized MoE kernel, bounded by
+        // launch geometry rather than the templated kernels' limit
+        const auto & dev_info = ggml_cuda_info().devices[ggml_cuda_get_device()];
+        GGML_ASSERT(!ids || ne12 <= dev_info.max_threads_per_block / dev_info.warp_size);
+    }
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
