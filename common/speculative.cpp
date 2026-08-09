@@ -1013,7 +1013,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+        // DSpark consumes the draft's results through the nextn channel only:
+        // extract it for every token (masked = false) and mark no batch rows
+        // as outputs, so the decode never copies the draft's full-vocabulary
+        // logits to the host. DFlash samples the draft's logits on the host
+        // and keeps the output-row flow.
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dspark);
         llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
     }
 
@@ -1185,7 +1190,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
+                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, !is_dspark);
             }
         }
 

@@ -184,6 +184,13 @@ LLAMA_API void llama_set_spec_verify_sampling(struct llama_context * ctx, bool v
 // -1 when verify sampling was not active for that decode.
 LLAMA_API llama_token llama_get_spec_verify_sampled_ith(struct llama_context * ctx, int32_t i);
 
+// Declare that a sequence consumes its verify decodes exclusively through the
+// getters above: when every output row of a decode belongs to an opted-out
+// sequence (or one with a backend sampler), the full-vocabulary logits copy
+// to the host is skipped. Callers must clear the flag before decodes whose
+// logits they read on the host again (prompt processing, host-sampled rows).
+LLAMA_API void llama_set_spec_verify_backend_only(struct llama_context * ctx, llama_seq_id seq_id, bool value);
+
 // A draft's proposal distribution for one sequence's next verify decode:
 // n_pos positions, each with n_cand normalized candidate probabilities
 // followed by n_cand candidate ids (float-encoded), laid out position-major.

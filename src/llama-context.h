@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <set>
 #include <vector>
 
 struct llama_model;
@@ -121,6 +122,7 @@ struct llama_context {
     void set_spec_verify_sampling(bool value);
     bool set_decode_embd_enc(bool value);
     void set_spec_verify_draft_dist(llama_seq_id seq_id, const float * data, uint32_t n_pos, uint32_t n_cand);
+    void set_spec_verify_backend_only(llama_seq_id seq_id, bool value);
 
     llama_token get_spec_verify_sampled_ith(int32_t i);
     bool get_spec_verify_ratio_ith(int32_t i, float * p_draft, llama_token * residual);
@@ -347,6 +349,10 @@ private:
     // per-sequence draft proposal distributions for the next verify decode;
     // consumed as graph-input values, stable address like dspark_draft_sampling
     std::map<llama_seq_id, llama_spec_verify_draft_dist> spec_verify_draft_dists;
+
+    // sequences whose verify decodes are consumed exclusively through the
+    // backend getters - their output rows do not require host logits
+    std::set<llama_seq_id> spec_verify_backend_only;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE

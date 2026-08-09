@@ -1245,6 +1245,14 @@ void llama_context::set_spec_verify_draft_dist(llama_seq_id seq_id, const float 
     dist.data.assign(data, data + (size_t) n_pos * 2 * n_cand);
 }
 
+void llama_context::set_spec_verify_backend_only(llama_seq_id seq_id, bool value) {
+    if (value) {
+        spec_verify_backend_only.insert(seq_id);
+    } else {
+        spec_verify_backend_only.erase(seq_id);
+    }
+}
+
 bool llama_context::get_spec_verify_ratio_ith(int32_t i, float * p_draft, llama_token * residual) {
     synchronize();
 
@@ -1768,21 +1776,26 @@ static void copy_tensor_async_candidates(
     }
 }
 
-static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
+static bool needs_raw_logits(
+        const llama_ubatch & ubatch,
+        const std::map<llama_seq_id, llama_sampler *> & samplers,
+        const std::set<llama_seq_id> & verify_backend_only) {
     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
         if (!ubatch.output[i]) {
             continue;
         }
 
-        // Check if the output token has at least one sequence without a backend sampler.
+        // Check if the output token has at least one sequence that consumes
+        // host logits (neither a backend sampler nor backend-only verify).
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             llama_seq_id seq_id = ubatch.seq_id[i][j];
-            if (samplers.find(seq_id) == samplers.end()) {
+            if (samplers.find(seq_id) == samplers.end() &&
+                    verify_backend_only.find(seq_id) == verify_backend_only.end()) {
                 return true;
             }
         }
     }
-    return false; // all sequences use backend sampling
+    return false; // every output row is consumed through backend results
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
@@ -2006,7 +2019,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        static const std::set<llama_seq_id> no_backend_only;
+        if (logits.data && t_logits && n_outputs > 0 &&
+                needs_raw_logits(ubatch, sampling.samplers,
+                        cparams.spec_verify_sampling ? spec_verify_backend_only : no_backend_only)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -3900,6 +3916,10 @@ void llama_set_spec_verify_draft_dist(llama_context * ctx, llama_seq_id seq_id, 
 
 bool llama_get_spec_verify_ratio_ith(llama_context * ctx, int32_t i, float * p_draft, llama_token * residual) {
     return ctx->get_spec_verify_ratio_ith(i, p_draft, residual);
+}
+
+void llama_set_spec_verify_backend_only(llama_context * ctx, llama_seq_id seq_id, bool value) {
+    ctx->set_spec_verify_backend_only(seq_id, value);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

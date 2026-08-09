@@ -249,6 +249,10 @@ struct server_slot {
     std::mt19937 spec_rng;
     bool spec_rng_seeded = false;
 
+    // whether the pending verify decode was declared backend-only (its host
+    // logits were not extracted - host sampling must not run on it)
+    bool spec_backend_only = false;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -386,6 +390,11 @@ struct server_slot {
             spec_i_batch.clear();
             spec_ckpt.clear();
             spec_rng_seeded = false;
+
+            // the next task's prompt processing samples on the host
+            if (ctx_tgt) {
+                llama_set_spec_verify_backend_only(ctx_tgt, id, false);
+            }
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -520,6 +529,15 @@ struct server_slot {
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
     void handle_last_sampled_token(server_batch & batch) {
+        // verify rows are consumed through the backend getters when eligible -
+        // the decode then skips the host logits copy; any host-sampled row
+        // needs the logits again
+        if (can_speculate()) {
+            spec_backend_only = !spec_draft.empty() &&
+                    spec_can_backend_verify(task->params.sampling, llama_get_dspark_draft_n_cand(ctx_tgt));
+            llama_set_spec_verify_backend_only(ctx_tgt, id, spec_backend_only);
+        }
+
         bool add_ok = true;
         if (spec_draft.empty()) {
             // no speculative decoding
@@ -3966,6 +3984,10 @@ private:
                         accepted = common_sampler_accept_n_backend(slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                     }
                 }
+                // the host path samples from extracted logits - it must not run
+                // on a decode that skipped the logits copy
+                GGML_ASSERT(!(accepted.empty() && slot.spec_backend_only) &&
+                        "backend verify produced no results for a backend-only decode");
                 if (accepted.empty()) {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
