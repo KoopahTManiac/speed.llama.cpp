@@ -319,6 +319,12 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     const bool emit_dist = sampled_chain &&
             (int64_t) res->t_embd->ne[0] >= LLAMA_DSPARK_NEXTN_ROW_CAND + 2*n_cand;
 
+    // assembling the full [n_vocab, n_tok] logits costs a quadratic concat
+    // chain plus a permute pass; when no batch row requests outputs (the
+    // DSpark driver reads the nextn channel only), skip it entirely. The
+    // graph-reuse check compares n_outputs, so the structure switch is safe.
+    const bool need_logits = g.n_outputs > 0;
+
     ggml_tensor * cat        = nullptr;
     ggml_tensor * cat_conf   = nullptr;
     ggml_tensor * cat_ids    = nullptr;
@@ -334,7 +340,9 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]);
         ggml_tensor * col    = ggml_add(ctx0, base_i, bias);
 
-        cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
+        if (need_logits) {
+            cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
+        }
 
         // conf(i) = sigmoid(conf_proj . [conf_inp(i); markov_w1[prev(i)]] + b)  -- [1, n_blocks]
         ggml_tensor * conf_inp_i = ggml_view_2d(ctx0, conf_inp, conf_inp->ne[0], n_blocks,
@@ -378,9 +386,12 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     }
 
     // cat is position-major; restore ubatch block-major order
-    ggml_tensor * out = ggml_reshape_3d(ctx0, cat, n_vocab, n_blocks, block_drafts);
-    out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3)); // [n_vocab, block_drafts, n_blocks]
-    out = ggml_reshape_2d(ctx0, out, n_vocab, n_tok);
+    ggml_tensor * out = nullptr;
+    if (need_logits) {
+        out = ggml_reshape_3d(ctx0, cat, n_vocab, n_blocks, block_drafts);
+        out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3)); // [n_vocab, block_drafts, n_blocks]
+        out = ggml_reshape_2d(ctx0, out, n_vocab, n_tok);
+    }
 
     {
         ggml_tensor * conf = ggml_reshape_3d(ctx0, cat_conf, 1, n_blocks, block_drafts);
@@ -418,8 +429,10 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         ggml_build_forward_expand(g.gf, xtra);
     }
 
-    res->t_logits = out;
-    ggml_build_forward_expand(g.gf, out);
+    if (need_logits) {
+        res->t_logits = out;
+        ggml_build_forward_expand(g.gf, out);
+    }
 }
 
 // DFlash decoder, dual-mode by batch type:
