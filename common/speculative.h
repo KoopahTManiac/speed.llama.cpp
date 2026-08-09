@@ -48,6 +48,7 @@ struct common_speculative_draft_params {
     // (currently DSpark).
     float    temp  = 0.0f;
     float    top_p = 1.0f;
+    float    min_p = 0.0f;
     int32_t  top_k = 0;
     uint32_t seed  = 0;
 

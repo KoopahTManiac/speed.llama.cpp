@@ -125,6 +125,7 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 struct llama_dspark_draft_sampling {
     float    temp;
     float    top_p;
+    float    min_p;
     int32_t  top_k;
     uint32_t seed;
 };
@@ -142,6 +143,18 @@ LLAMA_API void llama_set_dspark_draft_sampling(
 // Structural: changing it rebuilds the draft graph; set before the first
 // decode. 0 (default) disables the sampled chain: drafting is greedy.
 LLAMA_API void llama_set_dspark_draft_n_cand(struct llama_context * ctx, uint32_t n_cand);
+
+// Speculative verify sampling: sample every output row of a decode in-graph
+// with the row's per-sequence config (same configs and capacity as above, set
+// on the TARGET context). The sampled ids are read with
+// llama_get_spec_verify_sampled_ith, indexed like llama_get_logits_ith.
+// Requests whose sampler chains go beyond temp/top-k/top-p/min-p (grammar,
+// penalties, ...) must use the host sampling path instead.
+LLAMA_API void llama_set_spec_verify_sampling(struct llama_context * ctx, bool value);
+
+// Returns the in-graph sampled token for output row i of the last decode, or
+// -1 when verify sampling was not active for that decode.
+LLAMA_API llama_token llama_get_spec_verify_sampled_ith(struct llama_context * ctx, int32_t i);
 
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);

@@ -1194,6 +1194,32 @@ void llama_context::set_dspark_draft_n_cand(uint32_t n_cand) {
     }
 }
 
+void llama_context::set_spec_verify_sampling(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    if (cparams.spec_verify_sampling != value) {
+        cparams.spec_verify_sampling = value;
+
+        sched_need_reserve = true;
+    }
+}
+
+llama_token llama_context::get_spec_verify_sampled_ith(int32_t i) {
+    synchronize();
+
+    if (i < 0 || (size_t) i >= output_ids.size()) {
+        return -1;
+    }
+
+    const int64_t row = output_ids[i];
+
+    if (row < 0 || (size_t) row >= spec_verify_sampled.size()) {
+        return -1;
+    }
+
+    return spec_verify_sampled[row];
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1863,6 +1889,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    spec_verify_sampled.clear();
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -2024,6 +2052,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
             }
+        }
+
+        // speculative verify: in-graph sampled token per output row
+        if (res->t_verify_sampled && n_outputs > 0) {
+            ggml_backend_t backend_v = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_verify_sampled);
+            GGML_ASSERT(backend_v != nullptr);
+            GGML_ASSERT(res->t_verify_sampled->ne[0] >= n_outputs);
+
+            spec_verify_sampled.resize(n_outputs_prev + n_outputs);
+            ggml_backend_tensor_get_async(backend_v, res->t_verify_sampled,
+                    spec_verify_sampled.data() + n_outputs_prev, 0, n_outputs*sizeof(llama_token));
         }
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
@@ -3778,6 +3817,14 @@ void llama_set_dspark_draft_sampling(llama_context * ctx, llama_seq_id seq_id, l
 
 void llama_set_dspark_draft_n_cand(llama_context * ctx, uint32_t n_cand) {
     ctx->set_dspark_draft_n_cand(n_cand);
+}
+
+void llama_set_spec_verify_sampling(llama_context * ctx, bool value) {
+    ctx->set_spec_verify_sampling(value);
+}
+
+llama_token llama_get_spec_verify_sampled_ith(llama_context * ctx, int32_t i) {
+    return ctx->get_spec_verify_sampled_ith(i);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

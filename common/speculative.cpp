@@ -1149,6 +1149,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 llama_set_dspark_draft_sampling(ctx_dft, seq_id, {
                     /*.temp  =*/ dp.temp,
                     /*.top_p =*/ dp.top_p,
+                    /*.min_p =*/ dp.min_p,
                     /*.top_k =*/ dp.top_k,
                     /*.seed  =*/ dp.seed,
                 });
@@ -2382,6 +2383,17 @@ common_speculative_init_result_ptr common_speculative_init_from_params(common_pa
     // the server is configured to request (see common_params_speculative_draft)
     if (params.speculative.draft.dspark_n_cand < 0) {
         params.speculative.draft.dspark_n_cand = std::max(params.sampling.top_k, 0);
+    }
+
+    // DSpark also samples the target's verify rows in-graph with the same
+    // configs; eligible requests then skip host-side verify sampling
+    // (common_sampler_accept_n_backend)
+    const bool has_dspark = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
+
+    if (has_dspark && ctx_tgt != nullptr && params.speculative.draft.dspark_n_cand > 0) {
+        llama_set_dspark_draft_n_cand(ctx_tgt, (uint32_t) params.speculative.draft.dspark_n_cand);
+        llama_set_spec_verify_sampling(ctx_tgt, true);
     }
 
     return std::make_unique<common_speculative_init_result>(params, model_tgt, ctx_tgt);

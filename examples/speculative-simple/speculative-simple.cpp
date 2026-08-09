@@ -186,6 +186,7 @@ int main(int argc, char ** argv) {
                 /* .id_last    = */ id_last,
                 /* .temp       = */ params.sampling.temp,
                 /* .top_p      = */ params.sampling.top_p,
+                /* .min_p      = */ params.sampling.min_p,
                 /* .top_k      = */ params.sampling.top_k,
                 /* .seed       = */ params.sampling.seed,
                 /* .prompt     = */ &prompt_tgt,

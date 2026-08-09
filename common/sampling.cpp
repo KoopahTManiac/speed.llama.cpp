@@ -1,5 +1,7 @@
 #include "sampling.h"
 
+#include "../src/llama-ext.h"
+
 #include "common.h"
 #include "fit.h"
 #include "log.h"
@@ -692,6 +694,40 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+}
+
+std::vector<llama_token> common_sampler_accept_n_backend(struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    size_t i = 0;
+    for (; i < draft.size(); i++) {
+        const llama_token id = llama_get_spec_verify_sampled_ith(ctx, idxs[i]);
+
+        if (id < 0) {
+            return {};
+        }
+
+        result.push_back(id);
+
+        if (draft[i] != id) {
+            break;
+        }
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = llama_get_spec_verify_sampled_ith(ctx, idxs[i]);
+
+        if (id < 0) {
+            return {};
+        }
+
+        result.push_back(id);
+    }
+
+    return result;
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

@@ -17,6 +17,24 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "../../src/llama-ext.h"
+
+// whether a request's sampler chain can be represented by the in-graph
+// speculative verify sampling (temp / top-k / top-p / min-p only)
+static bool spec_can_backend_verify(const common_params_sampling & sp) {
+    return sp.penalty_repeat  == 1.0f &&
+           sp.penalty_freq    == 0.0f &&
+           sp.penalty_present == 0.0f &&
+           sp.dry_multiplier  == 0.0f &&
+           sp.mirostat        == 0    &&
+           sp.typ_p           >= 1.0f &&
+           sp.xtc_probability <= 0.0f &&
+           sp.top_n_sigma     <  0.0f &&
+           sp.n_probs         == 0    &&
+           sp.grammar.empty()         &&
+           sp.logit_bias.empty();
+}
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -3035,11 +3053,22 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .top_p    = */ slot.task->params.sampling.top_p,
+                            /* .min_p    = */ slot.task->params.sampling.min_p,
                             /* .top_k    = */ slot.task->params.sampling.top_k,
                             /* .seed     = */ slot.task->params.sampling.seed,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
                         };
+
+                        // mirror the request's sampling on the target for
+                        // in-graph verify sampling
+                        llama_set_dspark_draft_sampling(slot.ctx_tgt, slot.id, {
+                            /* .temp  = */ slot.task->params.sampling.temp,
+                            /* .top_p = */ slot.task->params.sampling.top_p,
+                            /* .min_p = */ slot.task->params.sampling.min_p,
+                            /* .top_k = */ slot.task->params.sampling.top_k,
+                            /* .seed  = */ slot.task->params.sampling.seed,
+                        });
 
                         drafting.push_back(&slot);
                     }
@@ -3884,7 +3913,16 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+
+                // in-graph verify sampling fast path; requests whose sampler
+                // chain cannot run in-graph fall back to host sampling
+                std::vector<llama_token> accepted;
+                if (spec_can_backend_verify(slot.task->params.sampling)) {
+                    accepted = common_sampler_accept_n_backend(slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                }
+                if (accepted.empty()) {
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);

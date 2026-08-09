@@ -87,6 +87,15 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+// speculative verify fast path: read the target's in-graph sampled tokens
+// (llama_set_spec_verify_sampling) instead of sampling each position on the
+// host. Same acceptance semantics as common_sampler_sample_and_accept_n.
+// Returns an empty vector when the backend results are unavailable - callers
+// must then fall back to the host variant. Only valid for requests whose
+// sampler chain is representable in-graph (temp / top-k / top-p / min-p; no
+// grammar, no stateful samplers) - the caller is responsible for checking.
+std::vector<llama_token> common_sampler_accept_n_backend(struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.

@@ -1276,64 +1276,100 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
     return true;
 }
 
-void llm_graph_input_dspark_sampling::set_input(const llama_ubatch * ubatch) {
-    GGML_ASSERT(configs != nullptr);
+void llm_graph_input_dspark_sampling::buf_resize(int64_t n_uniform_rows, int64_t n_cand, int64_t n_cols) {
+    buf_uniform  .resize(n_uniform_rows * n_cols);
+    buf_inv_temp .resize(n_cols);
+    buf_topk_mask.resize(n_cand * n_cols);
+    buf_top_p    .resize(n_cols);
+    buf_min_p    .resize(n_cols);
+}
 
-    const int64_t n_cand        = inp_topk_mask->ne[0];
-    const int64_t block_drafts  = inp_uniform->ne[0];
-    const int64_t n_blocks      = inp_uniform->ne[1];
+void llm_graph_input_dspark_sampling::fill_col(llama_seq_id seq_id, int64_t col, int64_t n_uniform_rows) {
+    const int64_t n_cand = inp_topk_mask->ne[0];
 
-    GGML_ASSERT(n_blocks == ubatch->n_seqs_unq);
+    // sequences without a config draft greedily
+    llama_dspark_draft_sampling cfg = { 0.0f, 1.0f, 0.0f, 0, 0 };
+    if (const auto it = configs->find(seq_id); it != configs->end()) {
+        cfg = it->second;
+    }
 
-    std::vector<float> uniform (block_drafts * n_blocks);
-    std::vector<float> inv_temp(n_blocks);
-    std::vector<float> mask    (n_cand * n_blocks);
-    std::vector<float> top_p   (n_blocks);
+    const bool sampled = cfg.temp > 0.0f;
 
-    for (int64_t j = 0; j < n_blocks; ++j) {
-        const llama_seq_id seq_id = ubatch->seq_id_unq[j];
-
-        // sequences without a config draft greedily
-        llama_dspark_draft_sampling cfg = { 0.0f, 1.0f, 0, 0 };
-        if (const auto it = configs->find(seq_id); it != configs->end()) {
-            cfg = it->second;
-        }
-
-        const bool sampled = cfg.temp > 0.0f;
-
-        if (sampled) {
-            if (const auto it = seeds.find(seq_id); it == seeds.end() || it->second != cfg.seed) {
-                rngs [seq_id] = std::mt19937(cfg.seed);
-                seeds[seq_id] = cfg.seed;
-            }
-        }
-
-        // uniform = 0 makes the inverse CDF pick the highest-probability
-        // candidate, so greedy sequences share the sampled graph
-        std::uniform_real_distribution<double> dist(0.0, 1.0);
-        for (int64_t i = 0; i < block_drafts; ++i) {
-            uniform[i + j*block_drafts] = sampled ? (float) dist(rngs[seq_id]) : 0.0f;
-        }
-
-        inv_temp[j] = sampled ? 1.0f/cfg.temp : 1.0f;
-        top_p   [j] = sampled && cfg.top_p > 0.0f && cfg.top_p < 1.0f ? cfg.top_p : 1.0f;
-
-        const int64_t k = sampled && cfg.top_k > 0 ? std::min((int64_t) cfg.top_k, n_cand) : n_cand;
-        for (int64_t c = 0; c < n_cand; ++c) {
-            mask[c + j*n_cand] = c < k ? 0.0f : -INFINITY;
+    if (sampled) {
+        if (const auto it = seeds.find(seq_id); it == seeds.end() || it->second != cfg.seed) {
+            rngs [seq_id] = std::mt19937(cfg.seed);
+            seeds[seq_id] = cfg.seed;
         }
     }
 
-    ggml_backend_tensor_set(inp_uniform,   uniform.data(), 0,  uniform.size()*sizeof(float));
-    ggml_backend_tensor_set(inp_inv_temp, inv_temp.data(), 0, inv_temp.size()*sizeof(float));
-    ggml_backend_tensor_set(inp_topk_mask,    mask.data(), 0,     mask.size()*sizeof(float));
-    ggml_backend_tensor_set(inp_top_p,       top_p.data(), 0,    top_p.size()*sizeof(float));
+    // uniform = 0 makes the inverse CDF pick the highest-probability
+    // candidate, so greedy sequences share the sampled graph
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    for (int64_t i = 0; i < n_uniform_rows; ++i) {
+        buf_uniform[i + col*n_uniform_rows] = sampled ? (float) dist(rngs[seq_id]) : 0.0f;
+    }
+
+    buf_inv_temp[col] = sampled ? 1.0f/cfg.temp : 1.0f;
+    buf_top_p   [col] = sampled && cfg.top_p > 0.0f && cfg.top_p < 1.0f ? cfg.top_p : 1.0f;
+    buf_min_p   [col] = sampled && cfg.min_p > 0.0f && cfg.min_p < 1.0f ? cfg.min_p : 0.0f;
+
+    const int64_t k = sampled && cfg.top_k > 0 ? std::min((int64_t) cfg.top_k, n_cand) : n_cand;
+    for (int64_t c = 0; c < n_cand; ++c) {
+        buf_topk_mask[c + col*n_cand] = c < k ? 0.0f : -INFINITY;
+    }
+}
+
+void llm_graph_input_dspark_sampling::buf_flush() {
+    ggml_backend_tensor_set(inp_uniform,   buf_uniform.data(), 0,   buf_uniform.size()*sizeof(float));
+    ggml_backend_tensor_set(inp_inv_temp,  buf_inv_temp.data(), 0,  buf_inv_temp.size()*sizeof(float));
+    ggml_backend_tensor_set(inp_topk_mask, buf_topk_mask.data(), 0, buf_topk_mask.size()*sizeof(float));
+    ggml_backend_tensor_set(inp_top_p,     buf_top_p.data(), 0,     buf_top_p.size()*sizeof(float));
+    ggml_backend_tensor_set(inp_min_p,     buf_min_p.data(), 0,     buf_min_p.size()*sizeof(float));
+}
+
+void llm_graph_input_dspark_sampling::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(configs != nullptr);
+
+    const int64_t n_cand       = inp_topk_mask->ne[0];
+    const int64_t block_drafts = inp_uniform->ne[0];
+    const int64_t n_blocks     = inp_uniform->ne[1];
+
+    GGML_ASSERT(n_blocks == ubatch->n_seqs_unq);
+
+    buf_resize(block_drafts, n_cand, n_blocks);
+
+    for (int64_t j = 0; j < n_blocks; ++j) {
+        fill_col(ubatch->seq_id_unq[j], j, block_drafts);
+    }
+
+    buf_flush();
 }
 
 bool llm_graph_input_dspark_sampling::can_reuse(const llm_graph_params & params) {
     // configs live in context-owned storage and are consumed as input values;
     // only the storage identity matters for graph reuse
     return configs == params.dspark;
+}
+
+void llm_graph_input_spec_verify_sampling::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(configs != nullptr);
+
+    const int64_t n_cand = inp_topk_mask->ne[0];
+    const int64_t n_rows = inp_uniform->ne[1];
+
+    buf_resize(1, n_cand, n_rows);
+
+    // one column per output row, configured by the row's sequence
+    int64_t row = 0;
+    for (uint32_t i = 0; i < ubatch->n_tokens && row < n_rows; ++i) {
+        if (ubatch->output[i]) {
+            fill_col(ubatch->seq_id[i][0], row, 1);
+            row++;
+        }
+    }
+    GGML_ASSERT(row == n_rows && "output-row count mismatch in verify sampling");
+
+    buf_flush();
 }
 
 //
@@ -3697,6 +3733,110 @@ void llm_graph_context::build_pooling(
     res->t_embd_pooled = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+ggml_tensor * llm_graph_context::build_dspark_sampled_pick(
+        ggml_tensor * logits,
+        ggml_tensor * inp_uniform,
+        ggml_tensor * inp_inv_temp,
+        ggml_tensor * inp_topk_mask,
+        ggml_tensor * inp_top_p,
+        ggml_tensor * inp_min_p,
+        ggml_tensor * iota,
+        ggml_tensor * vocab_offs,
+        ggml_tensor * cand_offs) const {
+    GGML_ASSERT(ggml_is_contiguous(logits));
+
+    const int64_t n_vocab = logits->ne[0];
+    const int64_t n_cols  = logits->ne[1];
+    const int64_t n_cand  = inp_topk_mask->ne[0];
+
+    // sorted top-capacity candidates per column
+    ggml_tensor * idx = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, logits, (int) n_cand)); // [n_cand, n_cols] I32, desc
+
+    // gather the candidate logits: lift indices to f32, add per-column vocab
+    // offsets, and read the logits as one flat row
+    ggml_tensor * idxf = ggml_get_rows(ctx0, iota, ggml_reshape_1d(ctx0, idx, n_cand*n_cols));
+    idxf = ggml_reshape_2d(ctx0, ggml_cont(ctx0, idxf), n_cand, n_cols);
+
+    ggml_tensor * flat = ggml_cast(ctx0, ggml_add(ctx0, idxf, vocab_offs), GGML_TYPE_I32);
+    ggml_tensor * vals = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, logits, 1, n_vocab*n_cols),
+                                       ggml_reshape_1d(ctx0, flat, n_cand*n_cols));
+    vals = ggml_reshape_2d(ctx0, ggml_cont(ctx0, vals), n_cand, n_cols);
+
+    // top-k truncation
+    vals = ggml_add(ctx0, vals, inp_topk_mask);
+
+    // top-p and min-p keep-masks on the untempered distribution, matching the
+    // default host sampler order (filters first, temperature last). The top
+    // candidate is always kept.
+    ggml_tensor * probs_f = ggml_soft_max(ctx0, vals);
+    ggml_tensor * keep_p  = ggml_step(ctx0, ggml_add(ctx0,
+            ggml_scale(ctx0, ggml_sub(ctx0, ggml_cumsum(ctx0, probs_f), probs_f), -1.0f), inp_top_p));
+
+    // min-p keeps candidates with prob >= min_p * p_max; candidates are
+    // sorted, so p_max is row 0
+    ggml_tensor * p_max  = ggml_cont(ctx0, ggml_view_2d(ctx0, probs_f, 1, n_cols, probs_f->nb[1], 0));
+    ggml_tensor * keep_m = ggml_step(ctx0, ggml_sub(ctx0, probs_f, ggml_mul(ctx0, p_max, inp_min_p)));
+
+    // tempered distribution for the pick
+    ggml_tensor * probs = ggml_soft_max(ctx0, ggml_mul(ctx0, vals, inp_inv_temp));
+    probs = ggml_mul(ctx0, ggml_mul(ctx0, probs, keep_p), keep_m);
+
+    // inverse CDF against uniform * kept mass (no renormalization needed);
+    // uniform = 0 selects the top candidate (same technique as the dist
+    // backend sampler)
+    ggml_tensor * u   = ggml_mul(ctx0, inp_uniform, ggml_sum_rows(ctx0, probs));
+    ggml_tensor * hit = ggml_step(ctx0, ggml_sub(ctx0, ggml_cumsum(ctx0, probs), u));
+    ggml_tensor * pos = ggml_scale_bias(ctx0, ggml_sum_rows(ctx0, hit), -1.0f, (float) n_cand); // [1, n_cols]
+
+    // resolve the selected candidate rank back to a vocab token id
+    ggml_tensor * sel = ggml_cast(ctx0, ggml_add(ctx0, pos, cand_offs), GGML_TYPE_I32);
+
+    return ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, idx, 1, n_cand*n_cols),
+                                               ggml_reshape_1d(ctx0, sel, n_cols)), n_cols);
+}
+
+void llm_graph_context::build_verify_sampling() const {
+    if (!cparams.spec_verify_sampling || dspark == nullptr || cparams.dspark_draft_n_cand == 0) {
+        return;
+    }
+    if (!res->t_logits) {
+        return;
+    }
+
+    const int64_t n_vocab = res->t_logits->ne[0];
+    const int64_t n_rows  = res->t_logits->ne[1];
+    const int64_t n_cand  = cparams.dspark_draft_n_cand;
+
+    if (n_rows < 1) {
+        return;
+    }
+
+    ggml_tensor * inp_uniform   = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,      n_rows);
+    ggml_tensor * inp_inv_temp  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,      n_rows);
+    ggml_tensor * inp_topk_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_cand, n_rows);
+    ggml_tensor * inp_top_p     = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,      n_rows);
+    ggml_tensor * inp_min_p     = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,      n_rows);
+
+    for (ggml_tensor * t : { inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p }) {
+        ggml_set_input(t);
+    }
+
+    res->add_input(std::make_unique<llm_graph_input_spec_verify_sampling>(
+            dspark, inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p));
+
+    ggml_tensor * iota      = ggml_reshape_2d(ctx0, ggml_arange(ctx0, 0.0f, (float) n_vocab, 1.0f), 1, n_vocab);
+    ggml_tensor * rows_iota = ggml_arange(ctx0, 0.0f, (float) n_rows, 1.0f);
+
+    ggml_tensor * vocab_offs = ggml_reshape_2d(ctx0, ggml_scale(ctx0, rows_iota, (float) n_vocab), 1, n_rows);
+    ggml_tensor * cand_offs  = ggml_reshape_2d(ctx0, ggml_scale(ctx0, rows_iota, (float) n_cand),  1, n_rows);
+
+    ggml_tensor * ids = build_dspark_sampled_pick(res->t_logits,
+            inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p, iota, vocab_offs, cand_offs);
+
+    res->t_verify_sampled = ids;
+    ggml_build_forward_expand(gf, ids);
 }
 
 void llm_graph_context::build_sampling() const {

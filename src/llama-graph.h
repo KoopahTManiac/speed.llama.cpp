@@ -734,27 +734,53 @@ public:
             ggml_tensor * inp_uniform,
             ggml_tensor * inp_inv_temp,
             ggml_tensor * inp_topk_mask,
-            ggml_tensor * inp_top_p) :
+            ggml_tensor * inp_top_p,
+            ggml_tensor * inp_min_p) :
         configs(configs),
         inp_uniform(inp_uniform),
         inp_inv_temp(inp_inv_temp),
         inp_topk_mask(inp_topk_mask),
-        inp_top_p(inp_top_p) { }
+        inp_top_p(inp_top_p),
+        inp_min_p(inp_min_p) { }
     virtual ~llm_graph_input_dspark_sampling() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
 
+    // fill one column of the input tensors from a sequence's drafting config
+    void fill_col(llama_seq_id seq_id, int64_t col, int64_t n_uniform_rows);
+
     const std::map<llama_seq_id, llama_dspark_draft_sampling> * configs;
 
-    ggml_tensor * inp_uniform;   // F32 [block_drafts, n_blocks]
-    ggml_tensor * inp_inv_temp;  // F32 [1, n_blocks]
-    ggml_tensor * inp_topk_mask; // F32 [n_cand, n_blocks] additive (0 / -inf)
-    ggml_tensor * inp_top_p;     // F32 [1, n_blocks]
+    ggml_tensor * inp_uniform;   // F32 [n_uniform_rows, n_cols]
+    ggml_tensor * inp_inv_temp;  // F32 [1, n_cols]
+    ggml_tensor * inp_topk_mask; // F32 [n_cand, n_cols] additive (0 / -inf)
+    ggml_tensor * inp_top_p;     // F32 [1, n_cols]
+    ggml_tensor * inp_min_p;     // F32 [1, n_cols]
 
     // per-sequence RNG state, reseeded when the config's seed changes
     std::map<llama_seq_id, std::mt19937> rngs;
     std::map<llama_seq_id, uint32_t>     seeds;
+
+protected:
+    // staging buffers flushed to the tensors by set_input
+    std::vector<float> buf_uniform;
+    std::vector<float> buf_inv_temp;
+    std::vector<float> buf_topk_mask;
+    std::vector<float> buf_top_p;
+    std::vector<float> buf_min_p;
+
+    void buf_resize(int64_t n_uniform_rows, int64_t n_cand, int64_t n_cols);
+    void buf_flush();
+};
+
+// same inputs, filled per verify output row instead of per drafting block:
+// each output row samples with its sequence's config
+class llm_graph_input_spec_verify_sampling : public llm_graph_input_dspark_sampling {
+public:
+    using llm_graph_input_dspark_sampling::llm_graph_input_dspark_sampling;
+
+    void set_input(const llama_ubatch * ubatch) override;
 };
 
 //
@@ -951,6 +977,9 @@ public:
     std::map<llama_seq_id, ggml_tensor *> t_candidates;
     std::map<llama_seq_id, ggml_tensor *> t_sampled;
     std::map<llama_seq_id, ggml_tensor *> t_sampled_probs;
+
+    // speculative verify: one sampled token per output row (see build_verify_sampling)
+    ggml_tensor * t_verify_sampled = nullptr; // I32 [n_outputs]
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
@@ -1369,6 +1398,28 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+
+    // pick one token per column of `logits` [n_vocab, n_cols] by inverse CDF
+    // over the sorted top-n_cand candidates. Filters follow the default host
+    // sampler order (top-k, top-p, min-p on untempered probabilities, then
+    // temperature); uniform = 0 degenerates to argmax. Returns [n_cols] I32.
+    // Shared by the DSpark draft's markov chain and speculative verify.
+    ggml_tensor * build_dspark_sampled_pick(
+            ggml_tensor * logits,
+            ggml_tensor * inp_uniform,   // [1, n_cols]
+            ggml_tensor * inp_inv_temp,  // [1, n_cols]
+            ggml_tensor * inp_topk_mask, // [n_cand, n_cols]
+            ggml_tensor * inp_top_p,     // [1, n_cols]
+            ggml_tensor * inp_min_p,     // [1, n_cols]
+            ggml_tensor * iota,          // [1, n_vocab] f32 arange
+            ggml_tensor * vocab_offs,    // [1, n_cols] col*n_vocab
+            ggml_tensor * cand_offs      // [1, n_cols] col*n_cand
+            ) const;
+
+    // speculative verify: sample every output row in-graph with its sequence's
+    // drafting config (res->t_verify_sampled). Active when the context enables
+    // it (llama_set_spec_verify_sampling) and configs + capacity are set.
+    void build_verify_sampling() const;
 
     //
     // dense (out)

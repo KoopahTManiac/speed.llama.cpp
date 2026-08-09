@@ -28,6 +28,10 @@ struct llama_cparams {
     // it rebuilds the draft graph.
     uint32_t dspark_draft_n_cand = 0;
 
+    // speculative verify: sample every output row in-graph with its sequence's
+    // drafting config (see build_verify_sampling); requires dspark_draft_n_cand
+    bool spec_verify_sampling = false;
+
     float rope_freq_base;
     float rope_freq_scale;
 

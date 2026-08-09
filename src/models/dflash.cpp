@@ -271,6 +271,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     ggml_tensor * inp_inv_temp  = nullptr; // [1, n_blocks]
     ggml_tensor * inp_topk_mask = nullptr; // [n_cand, n_blocks]
     ggml_tensor * inp_top_p     = nullptr; // [1, n_blocks]
+    ggml_tensor * inp_min_p     = nullptr; // [1, n_blocks]
 
     ggml_tensor * cand_offs  = nullptr; // [1, n_blocks]: j*n_cand,  for flat gathers
     ggml_tensor * vocab_offs = nullptr; // [1, n_blocks]: j*n_vocab, for flat gathers
@@ -280,13 +281,14 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         inp_inv_temp  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,            n_blocks);
         inp_topk_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_cand,       n_blocks);
         inp_top_p     = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,            n_blocks);
+        inp_min_p     = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,            n_blocks);
 
-        for (ggml_tensor * t : { inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p }) {
+        for (ggml_tensor * t : { inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p }) {
             ggml_set_input(t);
         }
 
         res->add_input(std::make_unique<llm_graph_input_dspark_sampling>(
-                g.dspark, inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p));
+                g.dspark, inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p));
 
         ggml_tensor * blocks_iota = ggml_arange(ctx0, 0.0f, (float) n_blocks, 1.0f);
 
@@ -330,45 +332,12 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         if (!sampled_chain) {
             tok = ggml_argmax(ctx0, col);
         } else {
-            // sorted top-capacity candidates per block
-            ggml_tensor * idx = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, col, (int) n_cand)); // [n_cand, n_blocks] I32, desc
-
-            // gather the candidate logits: lift indices to f32, add per-block vocab
-            // offsets, and read col as a single flat row
-            ggml_tensor * idxf = ggml_get_rows(ctx0, iota, ggml_reshape_1d(ctx0, idx, n_cand*n_blocks));
-            idxf = ggml_reshape_2d(ctx0, ggml_cont(ctx0, idxf), n_cand, n_blocks);
-
-            ggml_tensor * flat = ggml_cast(ctx0, ggml_add(ctx0, idxf, vocab_offs), GGML_TYPE_I32);
-            ggml_tensor * vals = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, col, 1, n_vocab*n_blocks),
-                                               ggml_reshape_1d(ctx0, flat, n_cand*n_blocks));
-            vals = ggml_reshape_2d(ctx0, ggml_cont(ctx0, vals), n_cand, n_blocks);
-
-            // request sampling params: temperature scale, then top-k truncation
-            vals = ggml_add(ctx0, ggml_mul(ctx0, vals, inp_inv_temp), inp_topk_mask);
-
-            ggml_tensor * probs = ggml_soft_max(ctx0, vals); // [n_cand, n_blocks]
-
-            // nucleus truncation: keep candidates whose preceding cumulative mass
-            // is below top_p (the top candidate is always kept)
-            ggml_tensor * csum = ggml_cumsum(ctx0, probs);
-            ggml_tensor * keep = ggml_step(ctx0, ggml_add(ctx0,
-                    ggml_scale(ctx0, ggml_sub(ctx0, csum, probs), -1.0f), inp_top_p));
-            probs = ggml_mul(ctx0, probs, keep);
-
-            // inverse CDF against uniform * kept mass (no renormalization needed);
-            // uniform = 0 selects the top candidate, i.e. greedy sequences share
-            // this graph (same technique as the dist backend sampler)
+            // this position's uniforms across all blocks
             ggml_tensor * u = ggml_cont(ctx0, ggml_view_2d(ctx0, inp_uniform, 1, n_blocks,
                     inp_uniform->nb[1], i*inp_uniform->nb[0]));
-            u = ggml_mul(ctx0, u, ggml_sum_rows(ctx0, probs));
 
-            ggml_tensor * hit = ggml_step(ctx0, ggml_sub(ctx0, ggml_cumsum(ctx0, probs), u));
-            ggml_tensor * pos = ggml_scale_bias(ctx0, ggml_sum_rows(ctx0, hit), -1.0f, (float) n_cand); // [1, n_blocks]
-
-            // resolve the selected candidate rank back to a vocab token id
-            ggml_tensor * sel = ggml_cast(ctx0, ggml_add(ctx0, pos, cand_offs), GGML_TYPE_I32);
-            tok = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, idx, 1, n_cand*n_blocks),
-                                                      ggml_reshape_1d(ctx0, sel, n_blocks)), n_blocks);
+            tok = g.build_dspark_sampled_pick(col,
+                    u, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p, iota, vocab_offs, cand_offs);
         }
 
         ggml_tensor * tokf = ggml_get_rows(ctx0, iota, tok); // [1, n_blocks] F32
