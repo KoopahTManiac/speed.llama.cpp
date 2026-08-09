@@ -188,6 +188,31 @@ struct llama_model_loader {
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
+    // a pending upload of one gguf weight into a slice pattern of a fused
+    // tensor (see create_tensor_fused_pair); processed by load_all_data
+    struct llama_fused_upload {
+        std::string   src_name;   // gguf weight the data comes from
+        ggml_tensor * dst;        // fused tensor the data lands in
+        int64_t       n_chunks;   // dim-2 slabs (expert count; 1 for 2D)
+        size_t        chunk_bytes;
+        size_t        src_stride; // between consecutive source chunks
+        size_t        dst_off0;   // first chunk's destination offset
+        size_t        dst_stride; // between consecutive destination chunks
+    };
+
+    std::vector<llama_fused_upload> fused_uploads;
+
+    // Create one tensor holding tn_a's and tn_b's rows concatenated along
+    // dim 1 (per dim-2 slab), named tn_fused; the two gguf weights upload
+    // into its halves during load_all_data. The gguf file is unchanged -
+    // fusion happens at load time. ne describes ONE half (tn_a's dims);
+    // tn_b must match it in type and dims. Returns nullptr when either half
+    // is absent and TENSOR_NOT_REQUIRED is set.
+    struct ggml_tensor * create_tensor_fused_pair(
+        const llama_hparams & hparams, const buft_list_t * buft_list_layer,
+        const LLM_TN_IMPL & tn_fused, const LLM_TN_IMPL & tn_a, const LLM_TN_IMPL & tn_b,
+        const std::initializer_list<int64_t> & ne, int flags);
+
     void done_getting_tensors(bool partial = false) const;
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);

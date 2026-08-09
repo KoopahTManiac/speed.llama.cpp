@@ -1396,13 +1396,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (!layer.ffn_up_s && layer.ffn_up) {
                 layer.ffn_up_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
-            if (!layer.ffn_gate_shexp_s && layer.ffn_gate_shexp) {
+            // gate/up scales also load when the halves were fused at load time
+            if (!layer.ffn_gate_shexp_s && (layer.ffn_gate_shexp || layer.ffn_gate_up_shexp)) {
                 layer.ffn_gate_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_down_shexp_s && layer.ffn_down_shexp) {
                 layer.ffn_down_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
-            if (!layer.ffn_up_shexp_s && layer.ffn_up_shexp) {
+            if (!layer.ffn_up_shexp_s && (layer.ffn_up_shexp || layer.ffn_gate_up_shexp)) {
                 layer.ffn_up_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
 
@@ -1474,13 +1475,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (!layer.ffn_up_exps_in_s && layer.ffn_up_exps) {
                 layer.ffn_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
-            if (!layer.ffn_gate_shexp_in_s && layer.ffn_gate_shexp) {
+            // gate/up input scales also load when the halves were fused at load time
+            if (!layer.ffn_gate_shexp_in_s && (layer.ffn_gate_shexp || layer.ffn_gate_up_shexp)) {
                 layer.ffn_gate_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_down_shexp_in_s && layer.ffn_down_shexp) {
                 layer.ffn_down_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
-            if (!layer.ffn_up_shexp_in_s && layer.ffn_up_shexp) {
+            if (!layer.ffn_up_shexp_in_s && (layer.ffn_up_shexp || layer.ffn_gate_up_shexp)) {
                 layer.ffn_up_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ssm_in_in_s && layer.ssm_in) {
@@ -2879,6 +2881,15 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
     return create_tensor(*ml, tn, ne, flags);
+}
+
+ggml_tensor * llama_model_base::create_tensor_fused_pair(
+        const LLM_TN_IMPL & tn_fused, const LLM_TN_IMPL & tn_a, const LLM_TN_IMPL & tn_b,
+        const std::initializer_list<int64_t> & ne, int flags) {
+    GGML_ASSERT(ml != nullptr);
+    GGML_ASSERT(tn_fused.bid != -1);
+    const buft_list_t * buft_list_layer = pimpl->dev_layer.at(tn_fused.bid).buft_list;
+    return ml->create_tensor_fused_pair(hparams, buft_list_layer, tn_fused, tn_a, tn_b, ne, flags);
 }
 
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {

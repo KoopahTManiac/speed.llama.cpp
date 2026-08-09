@@ -325,6 +325,8 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_shexp     = nullptr;
     struct ggml_tensor * ffn_down_shexp     = nullptr;
     struct ggml_tensor * ffn_up_shexp       = nullptr;
+    // gate|up halves concatenated at load time (see create_tensor_fused_pair)
+    struct ggml_tensor * ffn_gate_up_shexp  = nullptr;
 
     // ff adjugate experts (chexps)
     struct ggml_tensor * ffn_gate_chexps     = nullptr;
@@ -728,6 +730,12 @@ struct llama_model_base : public llama_model {
 
     // convenience overload of create_tensor that doesn't require llama_model_loader
     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // one tensor holding tn_a|tn_b rows concatenated along dim 1, uploaded
+    // from the two gguf weights at load time (no file change)
+    ggml_tensor * create_tensor_fused_pair(
+            const LLM_TN_IMPL & tn_fused, const LLM_TN_IMPL & tn_a, const LLM_TN_IMPL & tn_b,
+            const std::initializer_list<int64_t> & ne, int flags);
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,

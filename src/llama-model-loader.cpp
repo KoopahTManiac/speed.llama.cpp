@@ -1319,6 +1319,69 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     return tensor;
 }
 
+struct ggml_tensor * llama_model_loader::create_tensor_fused_pair(
+        const llama_hparams & hparams, const buft_list_t * buft_list_layer,
+        const LLM_TN_IMPL & tn_fused, const LLM_TN_IMPL & tn_a, const LLM_TN_IMPL & tn_b,
+        const std::initializer_list<int64_t> & ne, int flags) {
+    GGML_ASSERT(!(flags & (TENSOR_DUPLICATED | TENSOR_SKIP | TENSOR_ALLOW_RESHAPE)));
+
+    const struct ggml_tensor * meta_a = check_tensor_dims(tn_a.str(), ne, !(flags & TENSOR_NOT_REQUIRED), false);
+    const struct ggml_tensor * meta_b = check_tensor_dims(tn_b.str(), ne, !(flags & TENSOR_NOT_REQUIRED), false);
+    if (meta_a == nullptr || meta_b == nullptr) {
+        return nullptr;
+    }
+
+    if (meta_a->type != meta_b->type) {
+        throw std::runtime_error(format("%s: fused pair %s/%s type mismatch", __func__, tn_a.str().c_str(), tn_b.str().c_str()));
+    }
+    GGML_ASSERT(ggml_is_contiguous(meta_a) && ggml_is_contiguous(meta_b));
+
+    // fused meta: the halves' rows concatenated along dim 1, per dim-2 slab
+    ggml_tensor t_meta = *meta_a;
+    t_meta.ne[1] = meta_a->ne[1] + meta_b->ne[1];
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        t_meta.nb[d] = t_meta.nb[d-1]*t_meta.ne[d-1];
+    }
+    ggml_set_name(&t_meta, tn_fused.str().c_str());
+
+    const llm_tensor_info & info = llm_tensor_info_for(tn_fused.tensor);
+    GGML_ASSERT(info.layer == LLM_TENSOR_LAYER_REPEATING);
+
+    ggml_backend_buffer_type_t buft = select_weight_buft(hparams, &t_meta, info.op, buft_list_layer);
+    if (!buft) {
+        throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn_fused.str().c_str()));
+    }
+
+    // one ggml context per buffer type (mirrors create_tensor)
+    ggml_context * ctx = nullptr;
+    if (auto it = ctx_map.find(buft); it != ctx_map.end()) {
+        ctx = it->second.get();
+    } else {
+        const size_t ctx_size = ggml_tensor_overhead()*(n_tensors + 1 + hparams.n_layer()*2);
+        ggml_init_params params = { ctx_size, NULL, true };
+        ctx = ggml_init(params);
+        if (!ctx) {
+            throw std::runtime_error(format("failed to create ggml context"));
+        }
+        ctx_map.emplace(buft, ctx);
+    }
+
+    struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
+    ggml_set_name(tensor, tn_fused.str().c_str());
+
+    // register the two halves' uploads: per dim-2 slab, a's rows then b's
+    const size_t slab_a = (size_t) meta_a->nb[1]*meta_a->ne[1];
+    const size_t slab_b = (size_t) meta_b->nb[1]*meta_b->ne[1];
+    const int64_t n_chunks = meta_a->ne[2]*meta_a->ne[3];
+
+    fused_uploads.push_back({ tn_a.str(), tensor, n_chunks, slab_a, slab_a, 0,      slab_a + slab_b });
+    fused_uploads.push_back({ tn_b.str(), tensor, n_chunks, slab_b, slab_b, slab_a, slab_a + slab_b });
+
+    n_created += 2;
+
+    return tensor;
+}
+
 void llama_model_loader::done_getting_tensors(bool partial) const {
     if (n_created > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
@@ -1643,6 +1706,40 @@ bool llama_model_loader::load_all_data(
                     }
                 }
             }
+        }
+
+        size_done += n_size;
+    }
+
+    // upload the halves of load-time fused tensors (create_tensor_fused_pair):
+    // each source weight lands in its slice pattern of the fused tensor
+    for (const auto & fu : fused_uploads) {
+        if (fu.dst->buffer == nullptr || !ggml_get_tensor(ctx, ggml_get_name(fu.dst))) {
+            continue; // fused tensor lives in a different context of this load
+        }
+        const auto * w = get_weight(fu.src_name.c_str());
+        GGML_ASSERT(w != nullptr && "fused-pair source weight missing");
+
+        const size_t n_size = (size_t) fu.n_chunks * fu.chunk_bytes;
+
+        const uint8_t * data = nullptr;
+        if (use_mmap) {
+            data = (const uint8_t *) mappings.at(w->idx)->addr() + w->offs;
+        } else {
+            read_buf.resize(n_size);
+            const auto & file = files.at(w->idx);
+            file->seek(w->offs, SEEK_SET);
+            file->read_raw(read_buf.data(), n_size);
+            data = (const uint8_t *) read_buf.data();
+        }
+
+        if (check_tensors && !ggml_validate_row_data(fu.dst->type, data, n_size)) {
+            throw std::runtime_error(format("tensor '%s' has invalid data", fu.src_name.c_str()));
+        }
+
+        for (int64_t c = 0; c < fu.n_chunks; ++c) {
+            ggml_backend_tensor_set(fu.dst, data + (size_t) c*fu.src_stride,
+                    fu.dst_off0 + (size_t) c*fu.dst_stride, fu.chunk_bytes);
         }
 
         size_done += n_size;

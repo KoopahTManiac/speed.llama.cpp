@@ -100,10 +100,18 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
 
-        // Shared experts
+        // Shared experts: fuse the gate|up halves at load time when possible
+        // (one matmul instead of two per layer; the gguf is unchanged)
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
-        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
-        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, flags);
+        layer.ffn_gate_up_shexp  = create_tensor_fused_pair(
+                tn(LLM_TENSOR_FFN_GATE_UP_SHEXP, "weight", il),
+                tn(LLM_TENSOR_FFN_GATE_SHEXP,    "weight", il),
+                tn(LLM_TENSOR_FFN_UP_SHEXP,      "weight", il),
+                { n_embd, n_ff_shexp }, TENSOR_NOT_REQUIRED);
+        if (layer.ffn_gate_up_shexp == nullptr) {
+            layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", il), { n_embd, n_ff_shexp }, flags);
+            layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", il), { n_embd, n_ff_shexp }, flags);
+        }
         layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, flags);
     };
 
@@ -523,14 +531,38 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation
-    if (model.layers[il].ffn_up_shexp != nullptr) {
-        ggml_tensor * ffn_shexp =
-            build_ffn(cur,
-                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
-                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
-                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+    if (model.layers[il].ffn_up_shexp != nullptr || model.layers[il].ffn_gate_up_shexp != nullptr) {
+        ggml_tensor * ffn_shexp = nullptr;
+        if (model.layers[il].ffn_gate_up_shexp != nullptr) {
+            // load-time fused gate|up: one matmul, then per-half scales on
+            // row views and the gated activation
+            ggml_tensor * gate_up = build_lora_mm(model.layers[il].ffn_gate_up_shexp, cur);
+            cb(gate_up, "ffn_shexp_gate_up", il);
+
+            const int64_t n_ff_se = gate_up->ne[0]/2;
+            ggml_tensor * gate = ggml_view_2d(ctx0, gate_up, n_ff_se, gate_up->ne[1], gate_up->nb[1], 0);
+            ggml_tensor * up   = ggml_view_2d(ctx0, gate_up, n_ff_se, gate_up->ne[1], gate_up->nb[1], n_ff_se*gate_up->nb[0]);
+
+            if (model.layers[il].ffn_gate_shexp_s) {
+                gate = ggml_mul(ctx0, gate, model.layers[il].ffn_gate_shexp_s);
+            }
+            if (model.layers[il].ffn_up_shexp_s) {
+                up = ggml_mul(ctx0, up, model.layers[il].ffn_up_shexp_s);
+            }
+
+            ffn_shexp = ggml_swiglu_split(ctx0, gate, up);
+            cb(ffn_shexp, "ffn_shexp_glu", il);
+
+            ffn_shexp = build_lora_mm(model.layers[il].ffn_down_shexp, ffn_shexp, model.layers[il].ffn_down_shexp_s);
+        } else {
+            ffn_shexp =
+                build_ffn(cur,
+                    model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+                    model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+                    model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+                    NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+        }
         cb(ffn_shexp, "ffn_shexp", il);
 
         // Apply shared expert gating as in the reference implementation
