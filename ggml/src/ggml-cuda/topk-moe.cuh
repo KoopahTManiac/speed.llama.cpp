@@ -13,6 +13,8 @@ struct ggml_cuda_topk_moe_args {
     bool scale{};
 };
 
+// stage_logits: copy the logits into a scratch buffer before computing - for
+// multi-row batches whose output allocations alias the logits allocation
 void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
                            const ggml_tensor *             logits,
                            ggml_tensor *                   weights,
@@ -20,7 +22,8 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
                            const ggml_tensor *             clamp,
                            const ggml_tensor *             scale,
                            const ggml_tensor *             bias,
-                           const ggml_cuda_topk_moe_args & args);
+                           const ggml_cuda_topk_moe_args & args,
+                           bool                            stage_logits = false);
 
 bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
                                    const ggml_tensor * weights,

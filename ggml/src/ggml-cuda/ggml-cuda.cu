@@ -3379,9 +3379,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 out_nodes[1] = i + ops.size() - 1;
 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
-                        ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
-                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                        ggml_cuda_should_use_topk_moe(node, logits, weights, ids)) {
+                    // the logits are this pattern's only external read; when an
+                    // output allocation aliases them (graph allocators reuse
+                    // freed buffers on decode graphs), the op stages the
+                    // logits into a scratch buffer instead of rejecting
+                    const bool stage_logits =
+                        !ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true);
+                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args, stage_logits);
                     return ops.size() - 1;
                 }
             } else if (!args.norm && !args.prob_bias) {

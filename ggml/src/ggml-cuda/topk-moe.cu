@@ -350,7 +350,8 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
                            const ggml_tensor *             clamp,
                            const ggml_tensor *             scale,
                            const ggml_tensor *             bias,
-                           const ggml_cuda_topk_moe_args & args) {
+                           const ggml_cuda_topk_moe_args & args,
+                           const bool                      stage_logits) {
     GGML_ASSERT(logits->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
@@ -362,6 +363,18 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     float *       weights_d = (float *) weights->data;
     int32_t *     ids_d     = (int32_t *) ids->data;
     float *       bias_d    = bias ? (float *) bias->data : nullptr;
+
+    // multi-row batches whose output allocations alias the logits allocation
+    // (graph allocators reuse freed buffers) stage the logits into a scratch
+    // buffer: rows are processed by independent blocks, so an in-place write
+    // could otherwise clobber another row's unread input
+    ggml_cuda_pool_alloc<float> logits_staged(ctx.pool());
+    if (stage_logits) {
+        logits_staged.alloc((size_t) n_rows * n_experts);
+        CUDA_CHECK(cudaMemcpyAsync(logits_staged.ptr, logits_d, (size_t) n_rows * n_experts * sizeof(float),
+                cudaMemcpyDeviceToDevice, ctx.stream()));
+        logits_d = logits_staged.ptr;
+    }
 
     float scale_val = scale ? ggml_get_op_params_f32(scale, 0) : 1.0f;
 
