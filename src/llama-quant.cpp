@@ -287,8 +287,14 @@ static void llama_tensor_dequantize_impl(
 //
 
 static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
-    // trivial checks first -- no string ops needed
-    if (params->only_copy)       return false;
+    if (params->only_copy) {
+        // an explicit --output-tensor-type still applies in copy mode, which
+        // enables surgical requants of the output tensor alone
+        if (!(params->output_tensor_type < GGML_TYPE_COUNT &&
+              strcmp(ggml_get_name(tensor), "output.weight") == 0)) {
+            return false;
+        }
+    }
 
     // quantize only 2D and 3D tensors (experts)
     if (ggml_n_dims(tensor) < 2) return false;
