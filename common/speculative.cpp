@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -1142,6 +1143,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             common_sampler_reset(smpls[seq_id].get());
 
+            if (is_dspark) {
+                // keep the in-graph chain's drafting distribution in sync with
+                // the request's sampling params (values only - no graph rebuild)
+                llama_set_dspark_draft_sampling(ctx_dft, seq_id, {
+                    /*.temp  =*/ dp.temp,
+                    /*.top_p =*/ dp.top_p,
+                    /*.top_k =*/ dp.top_k,
+                    /*.seed  =*/ dp.seed,
+                });
+            }
+
             const int32_t n = (int32_t) dp.n_past;
 
             const int32_t n_draft = params.n_max;
@@ -1179,30 +1191,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             auto & result = *dp.result;
 
             if (is_dspark) {
-                // DSpark predicts the next token from position 0 and optionally truncates
-                // at the first position below the confidence threshold.
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                // DSpark reads the in-graph markov chain's tokens straight from the
+                // nextn channel — the chain already chose every position on-device
+                // (greedily or sampled per the sequence's drafting config), so there
+                // is no per-position host sampling. Optionally truncates at the
+                // first position below the confidence threshold.
+                const float * xtra = llama_get_embeddings_nextn(ctx_dft);
+                GGML_ASSERT(xtra && "DSpark draft requires the nextn embeddings channel");
 
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
-                    const int32_t idx = beg + i;
+                    const size_t row = (size_t) (beg + i) * n_embd_dec;
 
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                    if (params.p_min > 0.0f && xtra[row + LLAMA_DSPARK_NEXTN_ROW_CONF] < params.p_min) {
                         break;
                     }
 
-                    common_sampler_sample(smpl, ctx_dft, idx, true);
-
-                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                        LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
-                    }
-
-                    const llama_token id = cur_p->data[0].id;
-
-                    common_sampler_accept(smpl, id, true);
+                    const llama_token id = (llama_token) lroundf(xtra[row + LLAMA_DSPARK_NEXTN_ROW_TOKEN]);
 
                     result.push_back(id);
                 }
@@ -2374,6 +2378,12 @@ llama_context * common_speculative_init_result::context() {
 }
 
 common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt) {
+    // resolve the DSpark sampled-chain capacity: default to the largest top-k
+    // the server is configured to request (see common_params_speculative_draft)
+    if (params.speculative.draft.dspark_n_cand < 0) {
+        params.speculative.draft.dspark_n_cand = std::max(params.sampling.top_k, 0);
+    }
+
     return std::make_unique<common_speculative_init_result>(params, model_tgt, ctx_tgt);
 }
 
@@ -2432,6 +2442,12 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK: {
+                // capacity of the draft's in-graph sampled chain, resolved by
+                // common_speculative_init_from_params (<= 0: greedy chain)
+                if (params.draft.dspark_n_cand > 0) {
+                    llama_set_dspark_draft_n_cand(params.draft.ctx_dft, (uint32_t) params.draft.dspark_n_cand);
+                }
+
                 impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(
                         config.params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK));
                 break;

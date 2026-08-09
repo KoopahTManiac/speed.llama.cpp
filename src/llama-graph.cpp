@@ -1276,6 +1276,66 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
     return true;
 }
 
+void llm_graph_input_dspark_sampling::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(configs != nullptr);
+
+    const int64_t n_cand        = inp_topk_mask->ne[0];
+    const int64_t block_drafts  = inp_uniform->ne[0];
+    const int64_t n_blocks      = inp_uniform->ne[1];
+
+    GGML_ASSERT(n_blocks == ubatch->n_seqs_unq);
+
+    std::vector<float> uniform (block_drafts * n_blocks);
+    std::vector<float> inv_temp(n_blocks);
+    std::vector<float> mask    (n_cand * n_blocks);
+    std::vector<float> top_p   (n_blocks);
+
+    for (int64_t j = 0; j < n_blocks; ++j) {
+        const llama_seq_id seq_id = ubatch->seq_id_unq[j];
+
+        // sequences without a config draft greedily
+        llama_dspark_draft_sampling cfg = { 0.0f, 1.0f, 0, 0 };
+        if (const auto it = configs->find(seq_id); it != configs->end()) {
+            cfg = it->second;
+        }
+
+        const bool sampled = cfg.temp > 0.0f;
+
+        if (sampled) {
+            if (const auto it = seeds.find(seq_id); it == seeds.end() || it->second != cfg.seed) {
+                rngs [seq_id] = std::mt19937(cfg.seed);
+                seeds[seq_id] = cfg.seed;
+            }
+        }
+
+        // uniform = 0 makes the inverse CDF pick the highest-probability
+        // candidate, so greedy sequences share the sampled graph
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+        for (int64_t i = 0; i < block_drafts; ++i) {
+            uniform[i + j*block_drafts] = sampled ? (float) dist(rngs[seq_id]) : 0.0f;
+        }
+
+        inv_temp[j] = sampled ? 1.0f/cfg.temp : 1.0f;
+        top_p   [j] = sampled && cfg.top_p > 0.0f && cfg.top_p < 1.0f ? cfg.top_p : 1.0f;
+
+        const int64_t k = sampled && cfg.top_k > 0 ? std::min((int64_t) cfg.top_k, n_cand) : n_cand;
+        for (int64_t c = 0; c < n_cand; ++c) {
+            mask[c + j*n_cand] = c < k ? 0.0f : -INFINITY;
+        }
+    }
+
+    ggml_backend_tensor_set(inp_uniform,   uniform.data(), 0,  uniform.size()*sizeof(float));
+    ggml_backend_tensor_set(inp_inv_temp, inv_temp.data(), 0, inv_temp.size()*sizeof(float));
+    ggml_backend_tensor_set(inp_topk_mask,    mask.data(), 0,     mask.size()*sizeof(float));
+    ggml_backend_tensor_set(inp_top_p,       top_p.data(), 0,    top_p.size()*sizeof(float));
+}
+
+bool llm_graph_input_dspark_sampling::can_reuse(const llm_graph_params & params) {
+    // configs live in context-owned storage and are consumed as input values;
+    // only the storage identity matters for graph reuse
+    return configs == params.dspark;
+}
+
 //
 // llm_graph_result
 //
@@ -1462,6 +1522,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
+    dspark           (params.dspark),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),

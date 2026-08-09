@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "llama-ext.h"
 
 #include <cstdint>
 #include <vector>
@@ -11,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <random>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -719,6 +721,42 @@ public:
     std::map<llama_seq_id, llama_sampler *> samplers;
 };
 
+// inputs of the DSpark draft's sampled markov chain: per-(position, block)
+// inverse-CDF uniforms and per-block inv-temperature / top-k mask / top-p
+// threshold, filled from the context's per-sequence drafting configs
+// (llama_set_dspark_draft_sampling). Greedy sequences are expressed as
+// values (uniform = 0, inv_temp = 1, no truncation), so one static graph
+// serves any mix of greedy and sampled sequences.
+class llm_graph_input_dspark_sampling : public llm_graph_input_i {
+public:
+    llm_graph_input_dspark_sampling(
+            const std::map<llama_seq_id, llama_dspark_draft_sampling> * configs,
+            ggml_tensor * inp_uniform,
+            ggml_tensor * inp_inv_temp,
+            ggml_tensor * inp_topk_mask,
+            ggml_tensor * inp_top_p) :
+        configs(configs),
+        inp_uniform(inp_uniform),
+        inp_inv_temp(inp_inv_temp),
+        inp_topk_mask(inp_topk_mask),
+        inp_top_p(inp_top_p) { }
+    virtual ~llm_graph_input_dspark_sampling() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    const std::map<llama_seq_id, llama_dspark_draft_sampling> * configs;
+
+    ggml_tensor * inp_uniform;   // F32 [block_drafts, n_blocks]
+    ggml_tensor * inp_inv_temp;  // F32 [1, n_blocks]
+    ggml_tensor * inp_topk_mask; // F32 [n_cand, n_blocks] additive (0 / -inf)
+    ggml_tensor * inp_top_p;     // F32 [1, n_blocks]
+
+    // per-sequence RNG state, reseeded when the config's seed changes
+    std::map<llama_seq_id, std::mt19937> rngs;
+    std::map<llama_seq_id, uint32_t>     seeds;
+};
+
 //
 // llm_graph_result
 //
@@ -753,6 +791,11 @@ struct llm_graph_params {
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    // DSpark drafting configs, owned by the context (stable address, compared by
+    // pointer). Entries are graph-input values: they may change between decodes
+    // without rebuilding the graph.
+    const std::map<llama_seq_id, llama_dspark_draft_sampling> * dspark = nullptr;
 
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
@@ -993,6 +1036,8 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    const std::map<llama_seq_id, llama_dspark_draft_sampling> * dspark;
 
     const llm_graph_cb & cb_func;
 

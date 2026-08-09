@@ -100,6 +100,49 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+//
+// DSpark draft sampling
+//
+
+// Row layout of the DSpark draft's nextn channel (see build_dspark_markov_head):
+// row 0 holds each drafted position's acceptance confidence, row 1 the chain's
+// chosen token id (float-encoded; vocab sizes fit exactly in f32's integer range).
+#define LLAMA_DSPARK_NEXTN_ROW_CONF  0
+#define LLAMA_DSPARK_NEXTN_ROW_TOKEN 1
+
+// Per-sequence sampling configuration for the DSpark draft's markov chain,
+// mirroring the request's sampling parameters. temp <= 0 drafts greedily
+// (argmax); temp > 0 samples each position by inverse-CDF over the sorted
+// candidate set at the given temperature (the same technique as the dist
+// backend sampler), truncated by top_k (0 = disabled) and top_p (1.0 =
+// disabled), each position conditioned on the token actually sampled at the
+// previous one. All values are graph inputs: changing them does not rebuild
+// the graph.
+// Note: proposals are always truncated to the context's candidate capacity
+// (llama_set_dspark_draft_n_cand); a top_k of 0 or beyond the capacity
+// proposes from the top-capacity set. This only affects acceptance rates,
+// never output correctness.
+struct llama_dspark_draft_sampling {
+    float    temp;
+    float    top_p;
+    int32_t  top_k;
+    uint32_t seed;
+};
+
+// Configure the drafting distribution for one sequence of a DSpark draft
+// context. Takes effect on the next decode.
+LLAMA_API void llama_set_dspark_draft_sampling(
+        struct llama_context * ctx,
+        llama_seq_id           seq_id,
+        struct llama_dspark_draft_sampling sampling);
+
+// Set the candidate-set capacity of the sampled chain. The speculative driver
+// derives this from the largest top-k across the sequences it serves (falling
+// back to its configured sampling defaults for sequences without top-k).
+// Structural: changing it rebuilds the draft graph; set before the first
+// decode. 0 (default) disables the sampled chain: drafting is greedy.
+LLAMA_API void llama_set_dspark_draft_n_cand(struct llama_context * ctx, uint32_t n_cand);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

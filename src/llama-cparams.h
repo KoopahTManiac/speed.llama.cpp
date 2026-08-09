@@ -20,6 +20,14 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // DSpark draft: candidate-set capacity of the in-graph sampled markov chain.
+    // A graph-capacity bound (not a sampling preference): per-request top-k/top-p
+    // truncate within this set via input masks. The speculative driver derives it
+    // from the largest top-k across the sequences it serves; 0 (unset) means the
+    // sampled chain is unavailable and drafting is greedy. Structural: changing
+    // it rebuilds the draft graph.
+    uint32_t dspark_draft_n_cand = 0;
+
     float rope_freq_base;
     float rope_freq_scale;
 

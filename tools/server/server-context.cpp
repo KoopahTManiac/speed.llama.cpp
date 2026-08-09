@@ -3033,6 +3033,10 @@ private:
                             /* .n_max    = */ n_draft_max,
                             /* .n_past   = */ slot.prompt.n_tokens(),
                             /* .id_last  = */ slot.sampled,
+                            /* .temp     = */ slot.task->params.sampling.temp,
+                            /* .top_p    = */ slot.task->params.sampling.top_p,
+                            /* .top_k    = */ slot.task->params.sampling.top_k,
+                            /* .seed     = */ slot.task->params.sampling.seed,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
                         };

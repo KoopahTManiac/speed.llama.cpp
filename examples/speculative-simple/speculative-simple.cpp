@@ -184,6 +184,10 @@ int main(int argc, char ** argv) {
                 /* .n_max      = */ -1,
                 /* .n_past     = */ n_past,
                 /* .id_last    = */ id_last,
+                /* .temp       = */ params.sampling.temp,
+                /* .top_p      = */ params.sampling.top_p,
+                /* .top_k      = */ params.sampling.top_k,
+                /* .seed       = */ params.sampling.seed,
                 /* .prompt     = */ &prompt_tgt,
                 /* .result     = */ &draft, // output
             };

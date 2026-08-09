@@ -328,6 +328,10 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    // candidate-set capacity of DSpark's in-graph sampled chain
+    // (-1 - derive from the configured sampling top-k, 0 - disable, draft greedily)
+    int32_t dspark_n_cand = -1;
+
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     common_params_model mparams;

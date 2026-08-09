@@ -1177,6 +1177,23 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_dspark_draft_sampling(llama_seq_id seq_id, llama_dspark_draft_sampling sampling) {
+    LLAMA_LOG_DEBUG("%s: seq_id = %d, temp = %.3f, top_p = %.3f, top_k = %d, seed = %u\n",
+            __func__, seq_id, sampling.temp, sampling.top_p, sampling.top_k, sampling.seed);
+
+    dspark_draft_sampling[seq_id] = sampling;
+}
+
+void llama_context::set_dspark_draft_n_cand(uint32_t n_cand) {
+    LLAMA_LOG_DEBUG("%s: n_cand = %u\n", __func__, n_cand);
+
+    if (cparams.dspark_draft_n_cand != n_cand) {
+        cparams.dspark_draft_n_cand = n_cand;
+
+        sched_need_reserve = true;
+    }
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -2447,6 +2464,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
+        /*.dspark      =*/ &dspark_draft_sampling,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -3752,6 +3770,14 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+void llama_set_dspark_draft_sampling(llama_context * ctx, llama_seq_id seq_id, llama_dspark_draft_sampling sampling) {
+    ctx->set_dspark_draft_sampling(seq_id, sampling);
+}
+
+void llama_set_dspark_draft_n_cand(llama_context * ctx, uint32_t n_cand) {
+    ctx->set_dspark_draft_n_cand(n_cand);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

@@ -217,7 +217,15 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
     ggml_build_forward_expand(gf, cur);
 }
 
-// DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
+// DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position.
+// Every position's token is chosen in-graph. When the context has per-sequence
+// drafting configs (llama_set_dspark_draft_sampling) and a candidate capacity
+// (llama_set_dspark_draft_n_cand), positions are sampled by inverse CDF over
+// the sorted top-capacity candidates with the request's temperature, top-k and
+// top-p — so the chain conditions on the token that is actually proposed.
+// Otherwise the chain is greedy (argmax). The chosen ids and per-position
+// confidences are exposed through the nextn channel (LLAMA_DSPARK_NEXTN_ROW_*),
+// so the driver never reads the draft logits.
 static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
@@ -253,11 +261,48 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     // confidence head input: predicts per-position acceptance
     ggml_tensor * conf_inp = res->t_embd; // [n_embd, n_tok]
 
+    // the sampled chain is enabled by the driver via llama_set_dspark_draft_n_cand
+    // (structural) and configured per sequence via llama_set_dspark_draft_sampling
+    // (input values, see llm_graph_input_dspark_sampling)
+    const int64_t n_cand        = g.cparams.dspark_draft_n_cand;
+    const bool    sampled_chain = n_cand > 0 && g.dspark != nullptr;
+
+    ggml_tensor * inp_uniform   = nullptr; // [block_drafts, n_blocks]
+    ggml_tensor * inp_inv_temp  = nullptr; // [1, n_blocks]
+    ggml_tensor * inp_topk_mask = nullptr; // [n_cand, n_blocks]
+    ggml_tensor * inp_top_p     = nullptr; // [1, n_blocks]
+
+    ggml_tensor * cand_offs  = nullptr; // [1, n_blocks]: j*n_cand,  for flat gathers
+    ggml_tensor * vocab_offs = nullptr; // [1, n_blocks]: j*n_vocab, for flat gathers
+
+    if (sampled_chain) {
+        inp_uniform   = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, block_drafts, n_blocks);
+        inp_inv_temp  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,            n_blocks);
+        inp_topk_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_cand,       n_blocks);
+        inp_top_p     = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,            n_blocks);
+
+        for (ggml_tensor * t : { inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p }) {
+            ggml_set_input(t);
+        }
+
+        res->add_input(std::make_unique<llm_graph_input_dspark_sampling>(
+                g.dspark, inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p));
+
+        ggml_tensor * blocks_iota = ggml_arange(ctx0, 0.0f, (float) n_blocks, 1.0f);
+
+        cand_offs  = ggml_reshape_2d(ctx0, ggml_scale(ctx0, blocks_iota, (float) n_cand),  1, n_blocks);
+        vocab_offs = ggml_reshape_2d(ctx0, ggml_scale(ctx0, blocks_iota, (float) n_vocab), 1, n_blocks);
+    }
+
+    // float-encoded vocab indices, used both to emit the chain's token ids through
+    // the f32 nextn channel and to lift I32 indices into f32 offset arithmetic
+    // (vocab sizes fit exactly in f32's integer range)
+    ggml_tensor * iota = ggml_reshape_2d(ctx0, ggml_arange(ctx0, 0.0f, (float) n_vocab, 1.0f), 1, n_vocab);
+
     ggml_tensor * cat      = nullptr;
     ggml_tensor * cat_conf = nullptr;
+    ggml_tensor * cat_ids  = nullptr;
 
-    // TODO: the in-graph chain is greedy (argmax); sampling params affect only the final
-    //       token pick, not the Markov conditioning path
     for (int64_t i = 0; i < block_drafts; ++i) {
         ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev);   // [R, n_blocks]
         ggml_tensor * bias    = ggml_mul_mat(ctx0, w2, w1_prev); // [n_vocab, n_blocks]
@@ -280,8 +325,57 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
         cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
 
+        // chain token at position i, batched over all blocks
+        ggml_tensor * tok = nullptr; // [n_blocks] I32
+        if (!sampled_chain) {
+            tok = ggml_argmax(ctx0, col);
+        } else {
+            // sorted top-capacity candidates per block
+            ggml_tensor * idx = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, col, (int) n_cand)); // [n_cand, n_blocks] I32, desc
+
+            // gather the candidate logits: lift indices to f32, add per-block vocab
+            // offsets, and read col as a single flat row
+            ggml_tensor * idxf = ggml_get_rows(ctx0, iota, ggml_reshape_1d(ctx0, idx, n_cand*n_blocks));
+            idxf = ggml_reshape_2d(ctx0, ggml_cont(ctx0, idxf), n_cand, n_blocks);
+
+            ggml_tensor * flat = ggml_cast(ctx0, ggml_add(ctx0, idxf, vocab_offs), GGML_TYPE_I32);
+            ggml_tensor * vals = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, col, 1, n_vocab*n_blocks),
+                                               ggml_reshape_1d(ctx0, flat, n_cand*n_blocks));
+            vals = ggml_reshape_2d(ctx0, ggml_cont(ctx0, vals), n_cand, n_blocks);
+
+            // request sampling params: temperature scale, then top-k truncation
+            vals = ggml_add(ctx0, ggml_mul(ctx0, vals, inp_inv_temp), inp_topk_mask);
+
+            ggml_tensor * probs = ggml_soft_max(ctx0, vals); // [n_cand, n_blocks]
+
+            // nucleus truncation: keep candidates whose preceding cumulative mass
+            // is below top_p (the top candidate is always kept)
+            ggml_tensor * csum = ggml_cumsum(ctx0, probs);
+            ggml_tensor * keep = ggml_step(ctx0, ggml_add(ctx0,
+                    ggml_scale(ctx0, ggml_sub(ctx0, csum, probs), -1.0f), inp_top_p));
+            probs = ggml_mul(ctx0, probs, keep);
+
+            // inverse CDF against uniform * kept mass (no renormalization needed);
+            // uniform = 0 selects the top candidate, i.e. greedy sequences share
+            // this graph (same technique as the dist backend sampler)
+            ggml_tensor * u = ggml_cont(ctx0, ggml_view_2d(ctx0, inp_uniform, 1, n_blocks,
+                    inp_uniform->nb[1], i*inp_uniform->nb[0]));
+            u = ggml_mul(ctx0, u, ggml_sum_rows(ctx0, probs));
+
+            ggml_tensor * hit = ggml_step(ctx0, ggml_sub(ctx0, ggml_cumsum(ctx0, probs), u));
+            ggml_tensor * pos = ggml_scale_bias(ctx0, ggml_sum_rows(ctx0, hit), -1.0f, (float) n_cand); // [1, n_blocks]
+
+            // resolve the selected candidate rank back to a vocab token id
+            ggml_tensor * sel = ggml_cast(ctx0, ggml_add(ctx0, pos, cand_offs), GGML_TYPE_I32);
+            tok = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, idx, 1, n_cand*n_blocks),
+                                                      ggml_reshape_1d(ctx0, sel, n_blocks)), n_blocks);
+        }
+
+        ggml_tensor * tokf = ggml_get_rows(ctx0, iota, tok); // [1, n_blocks] F32
+        cat_ids = cat_ids ? ggml_concat(ctx0, cat_ids, tokf, 1) : tokf;
+
         if (i + 1 < block_drafts) {
-            prev = ggml_argmax(ctx0, col);
+            prev = tok;
         }
     }
 
@@ -295,10 +389,20 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         conf = ggml_cont(ctx0, ggml_permute(ctx0, conf, 0, 2, 1, 3));
         conf = ggml_reshape_2d(ctx0, conf, 1, n_tok);
 
-        // note: broadcast the [1, n_tok] confidences to n_embd-wide rows to be able to reuse `llama_get_embeddings_nextn`
-        conf = ggml_repeat(ctx0, conf, res->t_embd);
-        res->t_h_nextn = conf;
-        ggml_build_forward_expand(g.gf, conf);
+        ggml_tensor * ids = ggml_reshape_3d(ctx0, cat_ids, 1, n_blocks, block_drafts);
+        ids = ggml_cont(ctx0, ggml_permute(ctx0, ids, 0, 2, 1, 3));
+        ids = ggml_reshape_2d(ctx0, ids, 1, n_tok);
+
+        // pack through the n_embd-wide `llama_get_embeddings_nextn` channel
+        // (row layout defined by LLAMA_DSPARK_NEXTN_ROW_* in llama-ext.h)
+        static_assert(LLAMA_DSPARK_NEXTN_ROW_CONF == 0 && LLAMA_DSPARK_NEXTN_ROW_TOKEN == 1,
+                      "row packing below must match the channel layout");
+        constexpr int64_t n_rows_used = LLAMA_DSPARK_NEXTN_ROW_TOKEN + 1;
+
+        ggml_tensor * xtra = ggml_concat(ctx0, conf, ids, 0); // [n_rows_used, n_tok]
+        xtra = ggml_pad(ctx0, xtra, (int) (res->t_embd->ne[0] - n_rows_used), 0, 0, 0);
+        res->t_h_nextn = xtra;
+        ggml_build_forward_expand(g.gf, xtra);
     }
 
     res->t_logits = out;

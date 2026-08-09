@@ -116,6 +116,8 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    void set_dspark_draft_sampling(llama_seq_id seq_id, llama_dspark_draft_sampling sampling);
+    void set_dspark_draft_n_cand(uint32_t n_cand);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -322,6 +324,11 @@ private:
     };
 
     sampling_info sampling;
+
+    // per-sequence drafting distribution of a DSpark draft context, consumed as
+    // graph-input values by the sampled markov chain (see llama-ext.h). The map's
+    // address is stable so graph inputs can read current values at set_input time.
+    std::map<llama_seq_id, llama_dspark_draft_sampling> dspark_draft_sampling;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE

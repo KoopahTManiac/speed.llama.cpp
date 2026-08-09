@@ -43,6 +43,14 @@ struct common_speculative_draft_params {
     llama_pos   n_past;
     llama_token id_last;
 
+    // drafting distribution for this sequence, mirroring the request's sampling
+    // params; temp <= 0 drafts greedily. Used by drafters that sample in-graph
+    // (currently DSpark).
+    float    temp  = 0.0f;
+    float    top_p = 1.0f;
+    int32_t  top_k = 0;
+    uint32_t seed  = 0;
+
     // TODO: remove in the future by keeping track of the prompt from the _begin() call and the consecutive accept calls
     const llama_tokens * prompt;
 
