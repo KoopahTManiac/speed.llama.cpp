@@ -4174,6 +4174,99 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// GGML_OP_DSPARK_SAMPLE
+struct test_dspark_sample : public test_case {
+    const int64_t n_vocab;
+    const int64_t n_cand;
+    const int64_t n_cols;
+    const int64_t k_mask; // candidates kept by the additive top-k mask
+    const bool    emit_dist;
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_vocab, n_cand, n_cols, k_mask, emit_dist);
+    }
+
+    test_dspark_sample(int64_t n_vocab = 2048, int64_t n_cand = 40, int64_t n_cols = 9,
+            int64_t k_mask = 40, bool emit_dist = true)
+        : n_vocab(n_vocab), n_cand(n_cand), n_cols(n_cols), k_mask(k_mask), emit_dist(emit_dist) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * logits    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab, n_cols);
+        ggml_tensor * cand      = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_cand,  n_cols);
+        ggml_tensor * uniform   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1,       n_cols);
+        ggml_tensor * inv_temp  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1,       n_cols);
+        ggml_tensor * topk_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_cand,  n_cols);
+        ggml_tensor * top_p     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1,       n_cols);
+        ggml_tensor * min_p     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1,       n_cols);
+        ggml_set_name(logits,    "logits");
+        ggml_set_name(cand,      "cand");
+        ggml_set_name(uniform,   "uniform");
+        ggml_set_name(inv_temp,  "inv_temp");
+        ggml_set_name(topk_mask, "topk_mask");
+        ggml_set_name(top_p,     "top_p");
+        ggml_set_name(min_p,     "min_p");
+
+        ggml_tensor * out = ggml_dspark_sample(ctx, logits, cand,
+                uniform, inv_temp, topk_mask, top_p, min_p, emit_dist);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // logit values and candidate ids must be distinct within a column:
+        // ties would make the sort order (and the emitted id order)
+        // backend-dependent
+        std::vector<int32_t> perm(n_vocab);
+        auto reset_perm = [&]() {
+            for (int64_t v = 0; v < n_vocab; ++v) {
+                perm[v] = (int32_t) v;
+            }
+        };
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "logits") == 0) {
+                std::vector<float> data(n_vocab*n_cols);
+                for (int64_t j = 0; j < n_cols; ++j) {
+                    reset_perm();
+                    for (int64_t v = n_vocab - 1; v > 0; --v) {
+                        std::swap(perm[v], perm[rand() % (v + 1)]);
+                    }
+                    for (int64_t v = 0; v < n_vocab; ++v) {
+                        data[j*n_vocab + v] = 8.0f*perm[v]/n_vocab - 4.0f;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            } else if (strcmp(t->name, "cand") == 0) {
+                std::vector<int32_t> data(n_cand*n_cols);
+                for (int64_t j = 0; j < n_cols; ++j) {
+                    reset_perm();
+                    for (int64_t c = 0; c < n_cand; ++c) {
+                        std::swap(perm[c], perm[c + rand() % (n_vocab - c)]);
+                        data[j*n_cand + c] = perm[c];
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "topk_mask") == 0) {
+                std::vector<float> data(n_cand*n_cols);
+                for (int64_t j = 0; j < n_cols; ++j) {
+                    for (int64_t c = 0; c < n_cand; ++c) {
+                        data[j*n_cand + c] = c < k_mask ? 0.0f : -INFINITY;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            } else if (strcmp(t->name, "uniform") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "inv_temp") == 0) {
+                init_tensor_uniform(t, 0.7f, 2.0f);
+            } else if (strcmp(t->name, "top_p") == 0) {
+                init_tensor_uniform(t, 0.5f, 1.0f);
+            } else if (strcmp(t->name, "min_p") == 0) {
+                init_tensor_uniform(t, 0.0f, 0.2f);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -9723,6 +9816,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+
+    // (n_vocab, n_cand, n_cols, k_mask, emit_dist)
+    test_cases.emplace_back(new test_dspark_sample(2048, 40, 9, 40, true));  // production shape
+    test_cases.emplace_back(new test_dspark_sample(2048, 40, 9, 40, false));
+    test_cases.emplace_back(new test_dspark_sample(2048, 40, 9, 12, true));  // top-k truncation active
+    test_cases.emplace_back(new test_dspark_sample(2048, 40, 1, 20, true));  // single column
+    test_cases.emplace_back(new test_dspark_sample(4096, 64, 5, 64, true));  // max sort width
+    test_cases.emplace_back(new test_dspark_sample(500,  17, 3,  9, true));  // odd sizes, padded sort
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

@@ -1083,6 +1083,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DSPARK_SAMPLE",
 
     "UNARY",
 
@@ -1100,7 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1198,6 +1199,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dspark_sample(logits, cand, u, it, km, tp, mp)",
 
     "unary(x)",
 
@@ -1215,7 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6304,6 +6306,48 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_dspark_sample
+
+struct ggml_tensor * ggml_dspark_sample(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * cand,
+        struct ggml_tensor  * uniform,
+        struct ggml_tensor  * inv_temp,
+        struct ggml_tensor  * topk_mask,
+        struct ggml_tensor  * top_p,
+        struct ggml_tensor  * min_p,
+        bool                  emit_dist) {
+    const int64_t n_cols = logits->ne[1];
+    const int64_t n_cand = cand->ne[0];
+
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits));
+    GGML_ASSERT(cand->type   == GGML_TYPE_I32 && ggml_is_contiguous(cand));
+    GGML_ASSERT(cand->ne[1] == n_cols);
+    GGML_ASSERT(topk_mask->type == GGML_TYPE_F32 && topk_mask->ne[0] == n_cand && topk_mask->ne[1] == n_cols);
+
+    struct ggml_tensor * cfgs[4] = { uniform, inv_temp, top_p, min_p };
+    for (int i = 0; i < 4; ++i) {
+        GGML_ASSERT(cfgs[i]->type == GGML_TYPE_F32 && cfgs[i]->ne[0] == 1 && cfgs[i]->ne[1] == n_cols);
+    }
+
+    const int64_t ne[4] = { emit_dist ? 2 + 2*n_cand : 1, n_cols, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, emit_dist ? 1 : 0);
+
+    result->op     = GGML_OP_DSPARK_SAMPLE;
+    result->src[0] = logits;
+    result->src[1] = cand;
+    result->src[2] = uniform;
+    result->src[3] = inv_temp;
+    result->src[4] = topk_mask;
+    result->src[5] = top_p;
+    result->src[6] = min_p;
 
     return result;
 }

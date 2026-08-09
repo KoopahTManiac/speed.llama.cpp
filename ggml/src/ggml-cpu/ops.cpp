@@ -10944,6 +10944,114 @@ void ggml_compute_forward_gated_delta_net(
     }
 }
 
+// ggml_compute_forward_dspark_sample
+// reference implementation of the fused truncation sampler (see
+// ggml_dspark_sample in ggml.h); mirrors the composed op chain it replaces
+
+void ggml_compute_forward_dspark_sample(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * logits    = dst->src[0];
+    const ggml_tensor * cand      = dst->src[1];
+    const ggml_tensor * uniform   = dst->src[2];
+    const ggml_tensor * inv_temp  = dst->src[3];
+    const ggml_tensor * topk_mask = dst->src[4];
+    const ggml_tensor * top_p     = dst->src[5];
+    const ggml_tensor * min_p     = dst->src[6];
+
+    const int64_t n_vocab = logits->ne[0];
+    const int64_t n_cols  = logits->ne[1];
+    const int64_t n_cand  = cand->ne[0];
+
+    const bool emit_dist = ggml_get_op_params_i32(dst, 0) != 0;
+    GGML_ASSERT(dst->ne[0] == (emit_dist ? 2 + 2*n_cand : 1));
+
+    std::vector<float>   val(n_cand);
+    std::vector<int32_t> ids(n_cand);
+    std::vector<int>     ord(n_cand);
+    std::vector<float>   q  (n_cand);
+
+    for (int64_t j = 0; j < n_cols; ++j) {
+        const float   * lj = (const float   *) ((const char *) logits->data + j*logits->nb[1]);
+        const int32_t * cj = (const int32_t *) ((const char *) cand->data   + j*cand->nb[1]);
+        const float   * mj = (const float   *) ((const char *) topk_mask->data + j*topk_mask->nb[1]);
+
+        const float u_j  = *(const float *) ((const char *) uniform->data  + j*uniform->nb[1]);
+        const float it_j = *(const float *) ((const char *) inv_temp->data + j*inv_temp->nb[1]);
+        const float tp_j = *(const float *) ((const char *) top_p->data    + j*top_p->nb[1]);
+        const float mp_j = *(const float *) ((const char *) min_p->data    + j*min_p->nb[1]);
+
+        for (int64_t c = 0; c < n_cand; ++c) {
+            const int32_t id = cj[c];
+            GGML_ASSERT(id >= 0 && id < n_vocab);
+            ids[c] = id;
+            val[c] = lj[id];
+            ord[c] = (int) c;
+        }
+
+        // order candidates by logit descending
+        std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return val[a] > val[b]; });
+
+        // sorted values with the additive top-k mask (mask is rank-ordered)
+        std::vector<float> sv(n_cand);
+        for (int64_t c = 0; c < n_cand; ++c) {
+            sv[c] = val[ord[c]] + mj[c];
+        }
+
+        // untempered softmax for the top-p / min-p keep decisions
+        float vmax = -INFINITY;
+        for (int64_t c = 0; c < n_cand; ++c) vmax = std::max(vmax, sv[c]);
+        float sum_f = 0.0f;
+        std::vector<float> pf(n_cand);
+        for (int64_t c = 0; c < n_cand; ++c) { pf[c] = expf(sv[c] - vmax); sum_f += pf[c]; }
+        for (int64_t c = 0; c < n_cand; ++c) { pf[c] /= sum_f; }
+
+        // tempered softmax, masked by the keep decisions
+        float tmax = -INFINITY;
+        for (int64_t c = 0; c < n_cand; ++c) tmax = std::max(tmax, sv[c]*it_j);
+        float sum_t = 0.0f;
+        for (int64_t c = 0; c < n_cand; ++c) { q[c] = expf(sv[c]*it_j - tmax); sum_t += q[c]; }
+
+        float cum_f = 0.0f;
+        float mass  = 0.0f;
+        for (int64_t c = 0; c < n_cand; ++c) {
+            q[c] /= sum_t;
+            const bool keep_p = -cum_f + tp_j > 0.0f; // cumulative mass before c
+            cum_f += pf[c];
+            const bool keep_m = pf[c] - pf[0]*mp_j > 0.0f;
+            if (!(keep_p && keep_m)) {
+                q[c] = 0.0f;
+            }
+            mass += q[c];
+        }
+
+        // inverse CDF at uniform * kept mass
+        const float u = u_j * mass;
+        float cum_q = 0.0f;
+        int64_t hits = 0;
+        for (int64_t c = 0; c < n_cand; ++c) {
+            cum_q += q[c];
+            hits += cum_q - u > 0.0f ? 1 : 0;
+        }
+        int64_t pos = n_cand - hits;
+        pos = std::min(std::max<int64_t>(pos, 0), n_cand - 1);
+
+        float * out = (float *) ((char *) dst->data + j*dst->nb[1]);
+        out[0] = (float) ids[ord[pos]];
+        if (emit_dist) {
+            const float inv_mass = mass > 0.0f ? 1.0f/mass : 0.0f;
+            out[1] = q[pos]*inv_mass;
+            for (int64_t c = 0; c < n_cand; ++c) {
+                out[2 + c]          = q[c]*inv_mass;
+                out[2 + n_cand + c] = (float) ids[ord[c]];
+            }
+        }
+    }
+}
 
 // ggml_compute_forward_dsv4_hc_comb
 

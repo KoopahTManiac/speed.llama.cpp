@@ -1448,19 +1448,25 @@ struct llm_graph_context {
     void build_sampling() const;
 
     // outputs of the sampled pick beyond the picked token, used by exact
-    // ratio acceptance (all optional to compute)
+    // ratio acceptance and the DSpark nextn channel packing. All are views
+    // into the GGML_OP_DSPARK_SAMPLE output; the q/ids rows exist only when
+    // the pick was built with emit_dist. Rows within a column are strided by
+    // the op's full row width - consumers that reshape must ggml_cont first.
     struct dspark_pick_dist {
+        ggml_tensor * tokf      = nullptr; // [1, n_cols] picked token id (f32)
         ggml_tensor * q_chosen  = nullptr; // [1, n_cols] proposal prob of the picked token
         ggml_tensor * cand_q    = nullptr; // [n_cand, n_cols] normalized proposal probs
         ggml_tensor * cand_idsf = nullptr; // [n_cand, n_cols] candidate vocab ids (f32)
+        ggml_tensor * packed    = nullptr; // [1+2*n_cand, n_cols] rows [q_chosen; cand_q; cand_idsf]
     };
 
     // pick one token per column of `logits` [n_vocab, n_cols] by inverse CDF
     // over the sorted top-n_cand candidates. Filters follow the default host
     // sampler order (top-k, top-p, min-p on untempered probabilities, then
     // temperature); uniform = 0 degenerates to argmax. Returns [n_cols] I32;
-    // when `dist` is given, also produces the proposal distribution.
-    // Shared by the DSpark draft's markov chain and speculative verify.
+    // when `dist` is given and emit_dist is set, also produces the proposal
+    // distribution. Shared by the DSpark draft's markov chain and
+    // speculative verify.
     ggml_tensor * build_dspark_sampled_pick(
             ggml_tensor * logits,
             ggml_tensor * inp_uniform,   // [1, n_cols]
@@ -1468,10 +1474,8 @@ struct llm_graph_context {
             ggml_tensor * inp_topk_mask, // [n_cand, n_cols]
             ggml_tensor * inp_top_p,     // [1, n_cols]
             ggml_tensor * inp_min_p,     // [1, n_cols]
-            ggml_tensor * iota,          // [1, n_vocab] f32 arange
-            ggml_tensor * vocab_offs,    // [1, n_cols] col*n_vocab
-            ggml_tensor * cand_offs,     // [1, n_cols] col*n_cand
-            dspark_pick_dist * dist = nullptr
+            dspark_pick_dist * dist = nullptr,
+            bool emit_dist = true
             ) const;
 
     // speculative verify: sample every output row in-graph with its sequence's

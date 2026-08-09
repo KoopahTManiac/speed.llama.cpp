@@ -574,6 +574,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSPARK_SAMPLE,
 
         GGML_OP_UNARY,
 
@@ -2582,6 +2583,36 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // Sample one token per column from candidate ids of a logits matrix,
+    // reproducing the composed truncation-sampler chain in one op:
+    // candidates ordered by logit descending, additive top-k mask, top-p and
+    // min-p keep-masks on the untempered softmax (the top candidate is always
+    // kept), tempered softmax, inverse-CDF pick at uniform * kept mass
+    // (uniform = 0 picks the top candidate).
+    //
+    // logits:    F32 [n_vocab, n_cols]
+    // cand:      I32 [n_cand,  n_cols]  candidate ids (order irrelevant)
+    // uniform:   F32 [1,       n_cols]
+    // inv_temp:  F32 [1,       n_cols]
+    // topk_mask: F32 [n_cand,  n_cols]  additive 0 / -inf, in sorted order
+    // top_p:     F32 [1,       n_cols]
+    // min_p:     F32 [1,       n_cols]
+    //
+    // result F32 [1, n_cols]: the sampled token id (float-encoded; vocab
+    // sizes fit exactly in f32's integer range). With emit_dist,
+    // F32 [2 + 2*n_cand, n_cols]: [token; q_chosen; q x n_cand (normalized,
+    // descending); candidate ids x n_cand (float-encoded, descending)].
+    GGML_API struct ggml_tensor * ggml_dspark_sample(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * cand,
+            struct ggml_tensor  * uniform,
+            struct ggml_tensor  * inv_temp,
+            struct ggml_tensor  * topk_mask,
+            struct ggml_tensor  * top_p,
+            struct ggml_tensor  * min_p,
+            bool                  emit_dist);
 
     // DSA lightning indexer
     //

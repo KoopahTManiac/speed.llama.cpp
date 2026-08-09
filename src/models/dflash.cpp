@@ -283,9 +283,6 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     ggml_tensor * inp_top_p     = nullptr; // [1, n_blocks]
     ggml_tensor * inp_min_p     = nullptr; // [1, n_blocks]
 
-    ggml_tensor * cand_offs  = nullptr; // [1, n_blocks]: j*n_cand,  for flat gathers
-    ggml_tensor * vocab_offs = nullptr; // [1, n_blocks]: j*n_vocab, for flat gathers
-
     if (sampled_chain) {
         inp_uniform   = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, block_drafts, n_blocks);
         inp_inv_temp  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,            n_blocks);
@@ -302,16 +299,11 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         inp->built_sampled = true;
 
         res->add_input(std::move(inp));
-
-        ggml_tensor * blocks_iota = ggml_arange(ctx0, 0.0f, (float) n_blocks, 1.0f);
-
-        cand_offs  = ggml_reshape_2d(ctx0, ggml_scale(ctx0, blocks_iota, (float) n_cand),  1, n_blocks);
-        vocab_offs = ggml_reshape_2d(ctx0, ggml_scale(ctx0, blocks_iota, (float) n_vocab), 1, n_blocks);
     }
 
-    // float-encoded vocab indices, used both to emit the chain's token ids through
-    // the f32 nextn channel and to lift I32 indices into f32 offset arithmetic
-    // (vocab sizes fit exactly in f32's integer range)
+    // float-encoded vocab indices, used to emit the greedy chain's token ids
+    // through the f32 nextn channel (vocab sizes fit exactly in f32's
+    // integer range)
     ggml_tensor * iota = ggml_reshape_2d(ctx0, ggml_arange(ctx0, 0.0f, (float) n_vocab, 1.0f), 1, n_vocab);
 
     // the proposal distribution feeds exact ratio acceptance; emitted only
@@ -325,12 +317,10 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     // graph-reuse check compares n_outputs, so the structure switch is safe.
     const bool need_logits = g.n_outputs > 0;
 
-    ggml_tensor * cat        = nullptr;
-    ggml_tensor * cat_conf   = nullptr;
-    ggml_tensor * cat_ids    = nullptr;
-    ggml_tensor * cat_q      = nullptr;
-    ggml_tensor * cat_cand_q = nullptr;
-    ggml_tensor * cat_cand_i = nullptr;
+    ggml_tensor * cat      = nullptr;
+    ggml_tensor * cat_conf = nullptr;
+    ggml_tensor * cat_ids  = nullptr;
+    ggml_tensor * cat_dist = nullptr; // [1+2*n_cand, ...] rows [q_chosen; cand_q; cand_idsf]
 
     for (int64_t i = 0; i < block_drafts; ++i) {
         ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev);   // [R, n_blocks]
@@ -357,27 +347,27 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
 
         // chain token at position i, batched over all blocks
-        ggml_tensor * tok = nullptr; // [n_blocks] I32
+        ggml_tensor * tok  = nullptr; // [n_blocks] I32
+        ggml_tensor * tokf = nullptr; // [1, n_blocks] F32
         if (!sampled_chain) {
-            tok = ggml_argmax(ctx0, col);
+            tok  = ggml_argmax(ctx0, col);
+            tokf = ggml_get_rows(ctx0, iota, tok);
         } else {
-            // this position's uniforms across all blocks
-            ggml_tensor * u = ggml_cont(ctx0, ggml_view_2d(ctx0, inp_uniform, 1, n_blocks,
-                    inp_uniform->nb[1], i*inp_uniform->nb[0]));
+            // this position's uniforms across all blocks (strided view; the
+            // fused pick reads it in place)
+            ggml_tensor * u = ggml_view_2d(ctx0, inp_uniform, 1, n_blocks,
+                    inp_uniform->nb[1], i*inp_uniform->nb[0]);
 
             llm_graph_context::dspark_pick_dist dist;
-            tok = g.build_dspark_sampled_pick(col,
-                    u, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p, iota, vocab_offs, cand_offs,
-                    emit_dist ? &dist : nullptr);
+            tok  = g.build_dspark_sampled_pick(col,
+                    u, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p, &dist, emit_dist);
+            tokf = dist.tokf;
 
             if (emit_dist) {
-                cat_q      = cat_q      ? ggml_concat(ctx0, cat_q,      dist.q_chosen,  1) : dist.q_chosen;
-                cat_cand_q = cat_cand_q ? ggml_concat(ctx0, cat_cand_q, dist.cand_q,    1) : dist.cand_q;
-                cat_cand_i = cat_cand_i ? ggml_concat(ctx0, cat_cand_i, dist.cand_idsf, 1) : dist.cand_idsf;
+                cat_dist = cat_dist ? ggml_concat(ctx0, cat_dist, dist.packed, 1) : dist.packed;
             }
         }
 
-        ggml_tensor * tokf = ggml_get_rows(ctx0, iota, tok); // [1, n_blocks] F32
         cat_ids = cat_ids ? ggml_concat(ctx0, cat_ids, tokf, 1) : tokf;
 
         if (i + 1 < block_drafts) {
@@ -398,7 +388,11 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         conf = ggml_cont(ctx0, ggml_permute(ctx0, conf, 0, 2, 1, 3));
         conf = ggml_reshape_2d(ctx0, conf, 1, n_tok);
 
-        ggml_tensor * ids = ggml_reshape_3d(ctx0, cat_ids, 1, n_blocks, block_drafts);
+        ggml_tensor * ids = cat_ids;
+        if (!ggml_is_contiguous(ids)) { // block_drafts == 1: still a view
+            ids = ggml_cont(ctx0, ids);
+        }
+        ids = ggml_reshape_3d(ctx0, ids, 1, n_blocks, block_drafts);
         ids = ggml_cont(ctx0, ggml_permute(ctx0, ids, 0, 2, 1, 3));
         ids = ggml_reshape_2d(ctx0, ids, 1, n_tok);
 
@@ -412,15 +406,17 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         int64_t n_rows_used = 2;
 
         if (emit_dist) {
-            auto to_block_major = [&](ggml_tensor * t, int64_t nr) {
-                t = ggml_reshape_3d(ctx0, t, nr, n_blocks, block_drafts);
-                t = ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3));
-                return ggml_reshape_2d(ctx0, t, nr, n_tok);
-            };
+            // cat_dist rows are already [q_chosen; cand_q; cand_idsf] - the
+            // channel layout - so one restore-to-block-major covers all three
+            ggml_tensor * t = cat_dist;
+            if (!ggml_is_contiguous(t)) { // block_drafts == 1: still a view
+                t = ggml_cont(ctx0, t);
+            }
+            t = ggml_reshape_3d(ctx0, t, 1 + 2*n_cand, n_blocks, block_drafts);
+            t = ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3));
+            t = ggml_reshape_2d(ctx0, t, 1 + 2*n_cand, n_tok);
 
-            xtra = ggml_concat(ctx0, xtra, to_block_major(cat_q,      1),      0);
-            xtra = ggml_concat(ctx0, xtra, to_block_major(cat_cand_q, n_cand), 0);
-            xtra = ggml_concat(ctx0, xtra, to_block_major(cat_cand_i, n_cand), 0);
+            xtra = ggml_concat(ctx0, xtra, t, 0);
             n_rows_used = LLAMA_DSPARK_NEXTN_ROW_CAND + 2*n_cand;
         }
 

@@ -3848,91 +3848,40 @@ ggml_tensor * llm_graph_context::build_dspark_sampled_pick(
         ggml_tensor * inp_topk_mask,
         ggml_tensor * inp_top_p,
         ggml_tensor * inp_min_p,
-        ggml_tensor * iota,
-        ggml_tensor * vocab_offs,
-        ggml_tensor * cand_offs,
-        dspark_pick_dist * dist) const {
+        dspark_pick_dist * dist,
+        bool emit_dist) const {
     GGML_ASSERT(ggml_is_contiguous(logits));
 
-    const int64_t n_vocab = logits->ne[0];
-    const int64_t n_cols  = logits->ne[1];
-    const int64_t n_cand  = inp_topk_mask->ne[0];
+    const int64_t n_cols = logits->ne[1];
+    const int64_t n_cand = inp_topk_mask->ne[0];
 
-    // fast top-k selection of the candidates (unordered), ordered afterwards
-    // by a small sort of just the survivors - a full-vocab sort per pick is
-    // far more expensive than selection + an n_cand-wide sort.
+    emit_dist = emit_dist && dist != nullptr;
+
+    // fast top-k selection of the candidates (unordered) - a full-vocab sort
+    // per pick is far more expensive than selection + an n_cand-wide sort.
     // note: backends without a large-row TOP_K implementation (e.g. CUDA
     // builds without CCCL >= 3.2) schedule this op on the CPU - correct, but
     // slow; such builds prefer the host sampling path anyway
     ggml_tensor * idx_u = ggml_top_k(ctx0, logits, (int) n_cand); // [n_cand, n_cols] I32, unordered
 
-    // gather the candidate logits: lift indices to f32, add per-column vocab
-    // offsets, and read the logits as one flat row
-    ggml_tensor * idxf_u = ggml_get_rows(ctx0, iota, ggml_reshape_1d(ctx0, idx_u, n_cand*n_cols));
-    idxf_u = ggml_reshape_2d(ctx0, ggml_cont(ctx0, idxf_u), n_cand, n_cols);
+    // fused ordering + truncation filters + inverse-CDF pick; backends
+    // without the op schedule it on the CPU (correct, slow - same note as
+    // TOP_K above)
+    ggml_tensor * out = ggml_dspark_sample(ctx0, logits, idx_u,
+            inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p, emit_dist);
 
-    ggml_tensor * flat_u = ggml_cast(ctx0, ggml_add(ctx0, idxf_u, vocab_offs), GGML_TYPE_I32);
-    ggml_tensor * vals_u = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, logits, 1, n_vocab*n_cols),
-                                         ggml_reshape_1d(ctx0, flat_u, n_cand*n_cols));
-    vals_u = ggml_reshape_2d(ctx0, ggml_cont(ctx0, vals_u), n_cand, n_cols);
-
-    // order the candidates descending (n_cand-wide bitonic)
-    ggml_tensor * perm  = ggml_argsort(ctx0, vals_u, GGML_SORT_ORDER_DESC); // [n_cand, n_cols] I32
-    ggml_tensor * permf = ggml_get_rows(ctx0, iota, ggml_reshape_1d(ctx0, perm, n_cand*n_cols));
-    permf = ggml_reshape_2d(ctx0, ggml_cont(ctx0, permf), n_cand, n_cols);
-
-    ggml_tensor * flat_p = ggml_reshape_1d(ctx0,
-            ggml_cast(ctx0, ggml_add(ctx0, permf, cand_offs), GGML_TYPE_I32), n_cand*n_cols);
-
-    ggml_tensor * vals = ggml_reshape_2d(ctx0, ggml_cont(ctx0,
-            ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, vals_u, 1, n_cand*n_cols), flat_p)), n_cand, n_cols);
-    ggml_tensor * idxf = ggml_reshape_2d(ctx0, ggml_cont(ctx0,
-            ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, idxf_u, 1, n_cand*n_cols), flat_p)), n_cand, n_cols);
-
-    // top-k truncation
-    vals = ggml_add(ctx0, vals, inp_topk_mask);
-
-    // top-p and min-p keep-masks on the untempered distribution, matching the
-    // default host sampler order (filters first, temperature last). The top
-    // candidate is always kept.
-    ggml_tensor * probs_f = ggml_soft_max(ctx0, vals);
-    ggml_tensor * keep_p  = ggml_step(ctx0, ggml_add(ctx0,
-            ggml_scale(ctx0, ggml_sub(ctx0, ggml_cumsum(ctx0, probs_f), probs_f), -1.0f), inp_top_p));
-
-    // min-p keeps candidates with prob >= min_p * p_max; candidates are
-    // sorted, so p_max is row 0
-    ggml_tensor * p_max  = ggml_cont(ctx0, ggml_view_2d(ctx0, probs_f, 1, n_cols, probs_f->nb[1], 0));
-    ggml_tensor * keep_m = ggml_step(ctx0, ggml_sub(ctx0, probs_f, ggml_mul(ctx0, p_max, inp_min_p)));
-
-    // tempered distribution for the pick
-    ggml_tensor * probs = ggml_soft_max(ctx0, ggml_mul(ctx0, vals, inp_inv_temp));
-    probs = ggml_mul(ctx0, ggml_mul(ctx0, probs, keep_p), keep_m);
-
-    // inverse CDF against uniform * kept mass (no renormalization needed);
-    // uniform = 0 selects the top candidate (same technique as the dist
-    // backend sampler)
-    ggml_tensor * u   = ggml_mul(ctx0, inp_uniform, ggml_sum_rows(ctx0, probs));
-    ggml_tensor * hit = ggml_step(ctx0, ggml_sub(ctx0, ggml_cumsum(ctx0, probs), u));
-    ggml_tensor * pos = ggml_scale_bias(ctx0, ggml_sum_rows(ctx0, hit), -1.0f, (float) n_cand); // [1, n_cols]
-
-    // guard the fp edge where the uniform lands above the rounded kept mass,
-    // which would otherwise index one past the candidate set
-    pos = ggml_clamp(ctx0, pos, 0.0f, (float) (n_cand - 1));
-
-    // resolve the selected candidate rank back to a vocab token id
-    ggml_tensor * sel = ggml_reshape_1d(ctx0,
-            ggml_cast(ctx0, ggml_add(ctx0, pos, cand_offs), GGML_TYPE_I32), n_cols);
-
-    ggml_tensor * tokf = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, idxf, 1, n_cand*n_cols), sel); // [1, n_cols] F32
+    ggml_tensor * tokf = emit_dist
+        ? ggml_view_2d(ctx0, out, 1, n_cols, out->nb[1], 0)
+        : out; // [1, n_cols] F32
 
     if (dist != nullptr) {
-        // the proposal distribution: kept tempered probs, normalized
-        ggml_tensor * q = ggml_div(ctx0, probs, ggml_sum_rows(ctx0, probs)); // [n_cand, n_cols]
-
-        dist->cand_q    = q;
-        dist->cand_idsf = idxf;
-        dist->q_chosen  = ggml_reshape_2d(ctx0,
-                ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, ggml_cont(ctx0, q), 1, n_cand*n_cols), sel), 1, n_cols);
+        dist->tokf = tokf;
+        if (emit_dist) {
+            dist->q_chosen  = ggml_view_2d(ctx0, out, 1,            n_cols, out->nb[1], 1*sizeof(float));
+            dist->cand_q    = ggml_view_2d(ctx0, out, n_cand,       n_cols, out->nb[1], 2*sizeof(float));
+            dist->cand_idsf = ggml_view_2d(ctx0, out, n_cand,       n_cols, out->nb[1], (2 + n_cand)*sizeof(float));
+            dist->packed    = ggml_view_2d(ctx0, out, 1 + 2*n_cand, n_cols, out->nb[1], 1*sizeof(float));
+        }
     }
 
     return ggml_reshape_1d(ctx0, ggml_cast(ctx0, tokf, GGML_TYPE_I32), n_cols);
@@ -3999,13 +3948,11 @@ void llm_graph_context::build_verify_sampling() const {
     ggml_tensor * iota      = ggml_reshape_2d(ctx0, ggml_arange(ctx0, 0.0f, (float) n_vocab, 1.0f), 1, n_vocab);
     ggml_tensor * rows_iota = ggml_arange(ctx0, 0.0f, (float) n_rows, 1.0f);
 
-    ggml_tensor * vocab_offs = ggml_reshape_2d(ctx0, ggml_scale(ctx0, rows_iota, (float) n_vocab), 1, n_rows);
-    ggml_tensor * cand_offs  = ggml_reshape_2d(ctx0, ggml_scale(ctx0, rows_iota, (float) n_cand),  1, n_rows);
+    ggml_tensor * cand_offs = ggml_reshape_2d(ctx0, ggml_scale(ctx0, rows_iota, (float) n_cand), 1, n_rows);
 
     dspark_pick_dist tdist;
     ggml_tensor * ids = build_dspark_sampled_pick(res->t_logits,
-            inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p, iota, vocab_offs, cand_offs,
-            &tdist);
+            inp_uniform, inp_inv_temp, inp_topk_mask, inp_top_p, inp_min_p, &tdist);
 
     res->t_verify_sampled = ids;
     ggml_build_forward_expand(gf, ids);
@@ -4015,8 +3962,10 @@ void llm_graph_context::build_verify_sampling() const {
     // distribution's support is within the target's candidate set, the
     // residual max(0, p - q) lives there too - no full-vocabulary work.
     {
-        ggml_tensor * p_norm = tdist.cand_q;    // [n_cand, n_rows] served probs
-        ggml_tensor * t_idsf = tdist.cand_idsf; // [n_cand, n_rows]
+        // the pick returns strided views into the fused-op output; the
+        // reshapes below need contiguous rows
+        ggml_tensor * p_norm = ggml_cont(ctx0, tdist.cand_q);    // [n_cand, n_rows] served probs
+        ggml_tensor * t_idsf = ggml_cont(ctx0, tdist.cand_idsf); // [n_cand, n_rows]
 
         auto eq = [&](ggml_tensor * a, ggml_tensor * b) {
             // 1 where |a - b| < 0.5 (ids are integer-valued floats)
