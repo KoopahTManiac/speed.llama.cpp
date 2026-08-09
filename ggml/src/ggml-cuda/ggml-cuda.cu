@@ -781,10 +781,79 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// Pinned staging for host<->device copies from/to pageable memory: a
+// synchronous copy involving pageable memory stages through the driver at a
+// fixed ~150 us cost regardless of size (measured on per-decode input
+// uploads). Bouncing through this pinned scratch turns the host side into a
+// plain memcpy and the transfer into a fast pinned copy; the remaining
+// stream synchronization only waits for the small copy itself. Copies
+// involving already-pinned memory and large copies keep the direct path.
+struct ggml_cuda_host_staging {
+    std::mutex mutex;
+    void *     ptr  = nullptr;
+    size_t     size = 0;
+
+    // staging cap: larger copies amortize the pageable staging cost on their
+    // own and would only waste pinned memory here
+    static constexpr size_t max_size = 16u << 20;
+};
+
+static ggml_cuda_host_staging & ggml_cuda_get_host_staging(int device) {
+    static ggml_cuda_host_staging staging[GGML_CUDA_MAX_DEVICES];
+    return staging[device];
+}
+
+static bool ggml_cuda_host_ptr_is_pinned(const void * p) {
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, p) != cudaSuccess) {
+        (void) cudaGetLastError(); // clear the error state
+        return false;
+    }
+    return attr.type == cudaMemoryTypeHost || attr.type == cudaMemoryTypeManaged;
+}
+
+// returns the locked staging area grown to fit size, or nullptr to use the direct path
+static std::unique_lock<std::mutex> ggml_cuda_host_staging_acquire(int device, size_t size, void ** out_ptr) {
+    *out_ptr = nullptr;
+    if (size > ggml_cuda_host_staging::max_size) {
+        return {};
+    }
+    auto & st = ggml_cuda_get_host_staging(device);
+    std::unique_lock<std::mutex> lock(st.mutex);
+    if (st.size < size) {
+        if (st.ptr) {
+            CUDA_CHECK(cudaFreeHost(st.ptr));
+            st.ptr  = nullptr;
+            st.size = 0;
+        }
+        void * p = nullptr;
+        if (cudaMallocHost(&p, size) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return {}; // pinned allocation failed - use the direct path
+        }
+        st.ptr  = p;
+        st.size = size;
+    }
+    *out_ptr = st.ptr;
+    return lock;
+}
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+
+    if (!ggml_cuda_host_ptr_is_pinned(data)) {
+        void * staging = nullptr;
+        auto lock = ggml_cuda_host_staging_acquire(ctx->device, size, &staging);
+        if (staging) {
+            memcpy(staging, data, size);
+            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, staging, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            return;
+        }
+    }
+
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -793,6 +862,18 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+
+    if (!ggml_cuda_host_ptr_is_pinned(data)) {
+        void * staging = nullptr;
+        auto lock = ggml_cuda_host_staging_acquire(ctx->device, size, &staging);
+        if (staging) {
+            CUDA_CHECK(cudaMemcpyAsync(staging, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            memcpy(data, staging, size);
+            return;
+        }
+    }
+
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
