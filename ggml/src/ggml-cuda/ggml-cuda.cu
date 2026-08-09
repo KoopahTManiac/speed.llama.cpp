@@ -4048,6 +4048,70 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // Runs of same-geometry CPY nodes (per-position recurrent-state rollback
+    // snapshots write K slots as K identical small copies): one batched
+    // launch replaces the run. Only copies whose src/dst tensors share type,
+    // shape and strides qualify; a dst overlapping another copy's src would
+    // change semantics under concurrent execution and breaks the run.
+    if (node->op == GGML_OP_CPY && ggml_cuda_cpy_can_batch(node->src[0], node->src[1])) {
+        const ggml_tensor * s0 = node->src[0];
+        const ggml_tensor * d0 = node->src[1];
+
+        const auto same_geometry = [](const ggml_tensor * a, const ggml_tensor * b) {
+            for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+                if (a->ne[k] != b->ne[k] || a->nb[k] != b->nb[k]) {
+                    return false;
+                }
+            }
+            return a->type == b->type;
+        };
+        const auto ranges_overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            const uintptr_t a0 = (uintptr_t) a->data, a1 = a0 + ggml_nbytes(a);
+            const uintptr_t b0 = (uintptr_t) b->data, b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+
+        // the copies' source/destination view nodes sit between the CPYs in
+        // the raw graph - skip them while scanning (they execute nothing)
+        const int j_max = std::min(cgraph->n_nodes, i + 64);
+
+        const ggml_tensor * run[CUDA_CPY_BATCH_MAX];
+        run[0] = node;
+        int n_batch = 1;
+        int i_end   = i;
+        for (int j = i + 1; j < j_max && n_batch < CUDA_CPY_BATCH_MAX; ++j) {
+            const ggml_tensor * cand = cgraph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(cand)) {
+                continue;
+            }
+            if (cand->op != GGML_OP_CPY ||
+                    !same_geometry(cand->src[0], s0) || !same_geometry(cand->src[1], d0)) {
+                break;
+            }
+            bool safe = true;
+            for (int k = 0; k < n_batch && safe; ++k) {
+                safe = !ranges_overlap(cand->src[1], run[k]->src[0]) &&
+                       !ranges_overlap(run[k]->src[1], cand->src[0]) &&
+                       !ranges_overlap(cand->src[1], run[k]->src[1]);
+            }
+            if (!safe) {
+                break;
+            }
+            run[n_batch++] = cand;
+            i_end = j;
+        }
+
+        if (n_batch >= 2) {
+            ggml_cuda_cpy_batch_ptrs ptrs{};
+            for (int k = 0; k < n_batch; ++k) {
+                ptrs.src[k] = (const char *) run[k]->src[0]->data;
+                ptrs.dst[k] = (char *)       run[k]->src[1]->data;
+            }
+            ggml_cuda_cpy_batched(*cuda_ctx, s0, d0, ptrs, n_batch);
+            return i_end - i;
+        }
+    }
+
     // Runs of MMQ matrix multiplications sharing one activation tensor (q/k/v
     // projections, GDN input projections): quantize the activation once for
     // the whole run instead of once per matmul. Every node in the run window
