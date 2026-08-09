@@ -2221,7 +2221,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
+    bool probs_reshaped = false;
     if (selected_experts == nullptr) {
+        if (arch != LLM_ARCH_GROVEMOE) {
+            // reshape the probs before the top-k: backends fuse the routing
+            // sequence softmax -> reshape -> argsort -> view -> get_rows into
+            // a single kernel when the nodes appear in this order
+            probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+            probs_reshaped = true;
+        }
         selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
@@ -2232,7 +2240,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
         selected_experts = ggml_cast(ctx0, ggml_scale(ctx0, f_sel, 1.0f / float(hparams.n_group_experts)), GGML_TYPE_I32);
         probs = ggml_reshape_3d(ctx0, probs, 1, hparams.n_expert, n_tokens);
-    } else {
+    } else if (!probs_reshaped) {
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
 
