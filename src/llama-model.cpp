@@ -1366,14 +1366,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (int i = 0; i < n_layer_all; ++i) {
             auto & layer = layers[i];
 
-            // attention weight scales (per-tensor, shape {1})
-            if (!layer.wq_s && layer.wq) {
+            // attention weight scales (per-tensor, shape {1}); the parts'
+            // scales also load when q|k|v were fused at load time
+            if (!layer.wq_s && (layer.wq || layer.wqkv_fused_parts)) {
                 layer.wq_s = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
-            if (!layer.wk_s && layer.wk) {
+            if (!layer.wk_s && (layer.wk || layer.wqkv_fused_parts)) {
                 layer.wk_s = create_tensor(tn(LLM_TENSOR_ATTN_K,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
-            if (!layer.wv_s && layer.wv) {
+            if (!layer.wv_s && (layer.wv || layer.wqkv_fused_parts)) {
                 layer.wv_s = create_tensor(tn(LLM_TENSOR_ATTN_V,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wo_s && layer.wo) {
@@ -1438,14 +1439,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.nextn.shared_head_head_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
 
-            // input scales
-            if (!layer.wq_in_s && layer.wq) {
+            // input scales; the q|k|v parts' also load when fused at load time
+            if (!layer.wq_in_s && (layer.wq || layer.wqkv_fused_parts)) {
                 layer.wq_in_s = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
-            if (!layer.wk_in_s && layer.wk) {
+            if (!layer.wk_in_s && (layer.wk || layer.wqkv_fused_parts)) {
                 layer.wk_in_s = create_tensor(tn(LLM_TENSOR_ATTN_K,   "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
-            if (!layer.wv_in_s && layer.wv) {
+            if (!layer.wv_in_s && (layer.wv || layer.wqkv_fused_parts)) {
                 layer.wv_in_s = create_tensor(tn(LLM_TENSOR_ATTN_V,   "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wo_in_s && layer.wo) {
@@ -2890,6 +2891,18 @@ ggml_tensor * llama_model_base::create_tensor_fused_pair(
     GGML_ASSERT(tn_fused.bid != -1);
     const buft_list_t * buft_list_layer = pimpl->dev_layer.at(tn_fused.bid).buft_list;
     return ml->create_tensor_fused_pair(hparams, buft_list_layer, tn_fused, tn_a, tn_b, ne, flags);
+}
+
+ggml_tensor * llama_model_base::create_tensor_fused_concat3(
+        const LLM_TN_IMPL & tn_fused,
+        const LLM_TN_IMPL & tn_a, const std::initializer_list<int64_t> & ne_a,
+        const LLM_TN_IMPL & tn_b, const std::initializer_list<int64_t> & ne_b,
+        const LLM_TN_IMPL & tn_c, const std::initializer_list<int64_t> & ne_c,
+        int flags) {
+    GGML_ASSERT(ml != nullptr);
+    GGML_ASSERT(tn_fused.bid != -1);
+    const buft_list_t * buft_list_layer = pimpl->dev_layer.at(tn_fused.bid).buft_list;
+    return ml->create_tensor_fused_concat3(hparams, buft_list_layer, tn_fused, tn_a, ne_a, tn_b, ne_b, tn_c, ne_c, flags);
 }
 
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {

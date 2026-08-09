@@ -74,8 +74,18 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", il), { n_embd }, flags);
 
         if (!hparams.is_recr(il)) {
-            // Attention layers
-            create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, flags);
+            // Attention layers: fuse q|k|v at load time when the gguf ships
+            // them separately (one matmul; the graph splits by row views)
+            layer.wqkv = create_tensor_fused_concat3(
+                    tn(LLM_TENSOR_ATTN_QKV, "weight", il),
+                    tn(LLM_TENSOR_ATTN_Q,   "weight", il), { n_embd, n_embd_head_k * n_head * 2 },
+                    tn(LLM_TENSOR_ATTN_K,   "weight", il), { n_embd, n_embd_k_gqa },
+                    tn(LLM_TENSOR_ATTN_V,   "weight", il), { n_embd, n_embd_v_gqa },
+                    TENSOR_NOT_REQUIRED);
+            layer.wqkv_fused_parts = layer.wqkv != nullptr;
+            if (layer.wqkv == nullptr) {
+                create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, flags);
+            }
             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { n_embd_head_k * n_head, n_embd }, flags);
 
             // Q/K normalization for attention layers
@@ -299,15 +309,38 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate.
-    // The three projections are built back to back so the backend can
-    // quantize their shared activation once (shared-src1 run fusion).
-    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
+    ggml_tensor * Qcur_full = nullptr; // [ (n_embd_head * 2) * n_head, n_tokens ]
+    ggml_tensor * Kcur      = nullptr;
+    ggml_tensor * Vcur      = nullptr;
+    if (model.layers[il].wqkv_fused_parts) {
+        // q|k|v concatenated at load time: one matmul, split by row views,
+        // per-part global scales applied on the views (identical row-wise
+        // arithmetic to the separate matmuls)
+        ggml_tensor * qkv = build_lora_mm(model.layers[il].wqkv, cur);
+        cb(qkv, "wqkv", il);
+
+        const int64_t q_dim = (int64_t) n_embd_head*2*n_head;
+        const int64_t k_dim = hparams.n_embd_k_gqa(il);
+        const int64_t v_dim = hparams.n_embd_v_gqa(il);
+
+        Qcur_full = ggml_view_2d(ctx0, qkv, q_dim, n_tokens, qkv->nb[1], 0);
+        Kcur      = ggml_view_2d(ctx0, qkv, k_dim, n_tokens, qkv->nb[1], q_dim*qkv->nb[0]);
+        Vcur      = ggml_view_2d(ctx0, qkv, v_dim, n_tokens, qkv->nb[1], (q_dim + k_dim)*qkv->nb[0]);
+
+        // the scale multiplies also materialize the views contiguously,
+        // which the downstream view/reshape math relies on
+        Qcur_full = model.layers[il].wq_s ? ggml_mul(ctx0, Qcur_full, model.layers[il].wq_s) : ggml_cont(ctx0, Qcur_full);
+        Kcur      = model.layers[il].wk_s ? ggml_mul(ctx0, Kcur,      model.layers[il].wk_s) : ggml_cont(ctx0, Kcur);
+        Vcur      = model.layers[il].wv_s ? ggml_mul(ctx0, Vcur,      model.layers[il].wv_s) : ggml_cont(ctx0, Vcur);
+    } else {
+        // built back to back so the backend can quantize the shared
+        // activation once (shared-src1 run fusion)
+        Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
+        Kcur      = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+        Vcur      = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    }
     cb(Qcur_full, "Qcur_full", il);
-
-    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
     cb(Kcur, "Kcur", il);
-
-    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
     cb(Vcur, "Vcur", il);
 
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,

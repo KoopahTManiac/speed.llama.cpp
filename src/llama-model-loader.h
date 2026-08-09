@@ -213,6 +213,16 @@ struct llama_model_loader {
         const LLM_TN_IMPL & tn_fused, const LLM_TN_IMPL & tn_a, const LLM_TN_IMPL & tn_b,
         const std::initializer_list<int64_t> & ne, int flags);
 
+    // Like create_tensor_fused_pair, but concatenating three gguf weights of
+    // possibly different dim-1 sizes (q|k|v projections).
+    struct ggml_tensor * create_tensor_fused_concat3(
+        const llama_hparams & hparams, const buft_list_t * buft_list_layer,
+        const LLM_TN_IMPL & tn_fused,
+        const LLM_TN_IMPL & tn_a, const std::initializer_list<int64_t> & ne_a,
+        const LLM_TN_IMPL & tn_b, const std::initializer_list<int64_t> & ne_b,
+        const LLM_TN_IMPL & tn_c, const std::initializer_list<int64_t> & ne_c,
+        int flags);
+
     void done_getting_tensors(bool partial = false) const;
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);

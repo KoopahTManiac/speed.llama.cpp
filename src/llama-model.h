@@ -253,6 +253,9 @@ struct llama_layer {
     struct ggml_tensor * wv        = nullptr;
     struct ggml_tensor * wo        = nullptr;
     struct ggml_tensor * wqkv      = nullptr;
+    // wqkv holds q|k|v concatenated at load time from separate gguf weights;
+    // the parts' scale sidecars (wq_s/wk_s/wv_s, ...) apply per row range
+    bool wqkv_fused_parts          = false;
     struct ggml_tensor * wq_a      = nullptr;
     struct ggml_tensor * wq_b      = nullptr;
     struct ggml_tensor * wkv_a_mqa = nullptr;
@@ -736,6 +739,14 @@ struct llama_model_base : public llama_model {
     ggml_tensor * create_tensor_fused_pair(
             const LLM_TN_IMPL & tn_fused, const LLM_TN_IMPL & tn_a, const LLM_TN_IMPL & tn_b,
             const std::initializer_list<int64_t> & ne, int flags);
+
+    // three-way variant with per-member dim-1 sizes (q|k|v projections)
+    ggml_tensor * create_tensor_fused_concat3(
+            const LLM_TN_IMPL & tn_fused,
+            const LLM_TN_IMPL & tn_a, const std::initializer_list<int64_t> & ne_a,
+            const LLM_TN_IMPL & tn_b, const std::initializer_list<int64_t> & ne_b,
+            const LLM_TN_IMPL & tn_c, const std::initializer_list<int64_t> & ne_c,
+            int flags);
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
