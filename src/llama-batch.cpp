@@ -320,7 +320,9 @@ bool llama_batch_allocr::init(
         }
     }
 
-    if (memory) {
+    // no token in the batch is assigned to more than one sequence -> the
+    // coupling matrix is empty, skip the O(n_seq_max^2) scan
+    if (memory && has_cpl) {
         for (uint32_t s0 = 0; s0 < n_seq_max; ++s0) {
             for (uint32_t s1 = 0; s1 < n_seq_max; ++s1) {
                 if (seq_cpl[s0][s1]) {

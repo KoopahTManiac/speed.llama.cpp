@@ -3947,8 +3947,10 @@ private:
 
             // verify and try to accept the draft
             {
-                // save the sampler sampler state in case we need to restore it
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // sampler state save for the checkpoint-restore path; the
+                // backend verify paths never mutate the sampler, so the
+                // clone is deferred to the host fallback that does
+                common_sampler_ptr smpl_save;
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
 
@@ -3989,6 +3991,7 @@ private:
                 GGML_ASSERT(!(accepted.empty() && slot.spec_backend_only) &&
                         "backend verify produced no results for a backend-only decode");
                 if (accepted.empty()) {
+                    smpl_save.reset(common_sampler_clone(slot.smpl.get()));
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
                 slot.spec_i_batch.clear();
@@ -4026,7 +4029,9 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                        slot.smpl = std::move(smpl_save);
+                        if (smpl_save) {
+                            slot.smpl = std::move(smpl_save);
+                        }
 
                         return;
                     }
