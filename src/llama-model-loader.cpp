@@ -846,6 +846,7 @@ struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) cons
     if (!weight) {
         return nullptr;
     }
+    used_names.insert(name);
     return weight->tensor;
 }
 
@@ -1458,6 +1459,12 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
     if (n_created < n_tensors) {
         if (!partial) {
+            int listed = 0;
+            for (const auto & it : weights_map) {
+                if (used_names.count(it.first) == 0 && listed++ < 10) {
+                    LLAMA_LOG_ERROR("%s: unconsumed tensor: %s\n", __func__, it.first.c_str());
+                }
+            }
             throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
         }
         LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",

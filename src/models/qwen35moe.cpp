@@ -75,8 +75,11 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
         if (!hparams.is_recr(il)) {
             // Attention layers: fuse q|k|v at load time when the gguf ships
-            // them separately (one matmul; the graph splits by row views)
-            layer.wqkv = create_tensor_fused_concat3(
+            // them separately (one matmul; the graph splits by row views).
+            // The fused path carries no bias terms - files with attention
+            // biases load through the separate path below
+            const bool attn_bias = ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_Q, "bias", il).str().c_str()) != nullptr;
+            layer.wqkv = attn_bias ? nullptr : create_tensor_fused_concat3(
                     tn(LLM_TENSOR_ATTN_QKV, "weight", il),
                     tn(LLM_TENSOR_ATTN_Q,   "weight", il), { n_embd, n_embd_head_k * n_head * 2 },
                     tn(LLM_TENSOR_ATTN_K,   "weight", il), { n_embd, n_embd_k_gqa },
