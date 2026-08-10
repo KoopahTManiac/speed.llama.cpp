@@ -81,6 +81,10 @@
 #define cudaMemset musaMemset
 #define cudaMemsetAsync musaMemsetAsync
 #define cudaMemGetInfo musaMemGetInfo
+#define cudaPointerAttributes musaPointerAttributes
+#define cudaPointerGetAttributes musaPointerGetAttributes
+#define cudaMemoryTypeHost musaMemoryTypeHost
+#define cudaMemoryTypeManaged musaMemoryTypeManaged
 #define cudaOccupancyMaxPotentialBlockSize musaOccupancyMaxPotentialBlockSize
 #define cudaSetDevice musaSetDevice
 #define cudaStreamCreateWithFlags musaStreamCreateWithFlags
