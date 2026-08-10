@@ -3418,6 +3418,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_topk_moe_args args;
         const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
         std::vector<ggml_op>    ops;
+        // reserve the maximum pattern length up front: repeated
+        // insert(initializer_list) reallocations trip a GCC 13/14
+        // -Wstringop-overflow false positive, fatal under -Werror
+        ops.reserve(24);
 
         if (can_fuse) {
             const ggml_tensor * logits  = node->src[0];
