@@ -1,3 +1,51 @@
+# speed.llama.cpp — DSPARK speculative-decoding performance branch
+
+A performance branch of [llama.cpp](https://github.com/ggml-org/llama.cpp)
+focused on **DSPARK speculative decoding** (`--spec-type draft-dspark`).
+Upstream implements DSPARK and serves it correctly; this branch makes it
+substantially faster and adds exact sampled acceptance:
+
+- **fused in-graph truncation sampler** (`GGML_OP_DSPARK_SAMPLE`): the
+  sort / top-k / top-p / min-p / inverse-CDF pick runs as one CUDA kernel
+  per drafted position instead of ~25 elementwise ops
+- **exact ratio acceptance** for sampled drafting (`min(1, p/q)` with
+  exact residual sampling) — the served distribution is identical to
+  non-speculative sampling at any temperature (verified by a
+  total-variation test over 3,200 completions per configuration)
+- CUDA fusions and reroutes on the serving path: MoE finalize fusion,
+  load-time QKV / gate-up weight fusion, batched same-geometry elementwise
+  launches, occupancy-derived GEMV/GEMM dispatch gates, pinned staging for
+  host copies
+- host-path fixes: deferred sampler clone, batch-init scan guard
+
+**Measured** (Qwen3.6-35B-A3B NVFP4 target + [DSPARK v2
+draft](https://huggingface.co/Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK-v2-GGUF),
+RTX PRO 6000 Blackwell, single user, 1024-token generations at temp 0.7):
+**506 tok/s** vs 352 on the upstream base (**+44%**) — ~89% of vLLM 0.26
+serving the same model + draft on the same GPU, while plain
+non-speculative decoding is ~9% *faster* than vLLM's. Details, model
+cards and deployment notes:
+[DSPARK-v2](https://huggingface.co/Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK-v2)
+·
+[DSPARK-v2-GGUF](https://huggingface.co/Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK-v2-GGUF).
+
+```bash
+cmake -B build -DGGML_CUDA=ON && cmake --build build -j
+./build/bin/llama-server \
+  -m  Qwen3.6-35B-A3B-NVFP4.gguf \
+  -md Qwen3.6-35B-A3B-NVFP4-DSPARK-v2-BF16.gguf \
+  --spec-type draft-dspark --spec-draft-n-max 8 \
+  -ngl 99 -fa on -c 8192
+```
+
+Known limits: `llama-server`'s per-slot host loop caps batched serving
+(~700 tok/s aggregate vs ~1,900 raw engine at bs64) — use vLLM/sglang at
+capacity, this branch for single-user/local. At high `-np`, pass
+`--cache-ram 0` and size `-ub ≥ slots × 8` (the draft block is
+non-causal). Everything below is upstream llama.cpp's README.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
