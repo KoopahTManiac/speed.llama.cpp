@@ -355,6 +355,138 @@ static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * 
     }
 }
 
+// batched flavor of k_bin_bcast_unravel: blockIdx.y selects the pointer
+// triple of one op in a run of same-geometry independent ops
+template <float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename dst_t>
+static __global__ void k_bin_bcast_unravel_batched(const ggml_cuda_binbcast_batch_ptrs ptrs,
+                                                   const uint3    ne0,
+                                                   const uint3    ne1,
+                                                   const uint3    ne2,
+                                                   const uint32_t ne3,
+                                                   const uint3    prod_012,
+                                                   const uint3    prod_01,
+                                                   const uint3    ne10,
+                                                   const uint3    ne11,
+                                                   const uint3    ne12,
+                                                   const uint3    ne13,
+                                                   const uint32_t s1,
+                                                   const uint32_t s2,
+                                                   const uint32_t s3,
+                                                   const uint32_t s00,
+                                                   const uint32_t s01,
+                                                   const uint32_t s02,
+                                                   const uint32_t s03,
+                                                   const uint32_t s10,
+                                                   const uint32_t s11,
+                                                   const uint32_t s12,
+                                                   const uint32_t s13) {
+    const src0_t * src0 = (const src0_t *) ptrs.src0[blockIdx.y];
+    const src1_t * src1 = (const src1_t *) ptrs.src1[blockIdx.y];
+    dst_t        * dst  = (dst_t *)        ptrs.dst [blockIdx.y];
+
+    const uint32_t i  = blockDim.x*blockIdx.x + threadIdx.x;
+
+    const uint32_t i3 = fastdiv(i, prod_012);
+    const uint32_t i2 = fastdiv(i - i3 * prod_012.z, prod_01);
+    const uint32_t i1 = fastdiv(i - i3 * prod_012.z - i2 * prod_01.z, ne0);
+    const uint32_t i0 = i - i3 * prod_012.z - i2 * prod_01.z - i1 * ne0.z;
+
+    if (i0 >= ne0.z || i1 >= ne1.z || i2 >= ne2.z || i3 >= ne3) {
+        return;
+    }
+
+    const uint32_t i11 = fastmodulo(i1, ne11);
+    const uint32_t i12 = fastmodulo(i2, ne12);
+    const uint32_t i13 = fastmodulo(i3, ne13);
+
+    const size_t i_src0 = size_t( i3)*s03 + size_t( i2)*s02 + size_t( i1)*s01;
+    const size_t i_src1 = size_t(i13)*s13 + size_t(i12)*s12 + size_t(i11)*s11;
+    const size_t i_dst  = size_t( i3)*s3  + size_t( i2)*s2  + size_t( i1)*s1;
+
+    const uint32_t i10 = fastmodulo(i0, ne10);
+
+    ggml_cuda_pdl_sync();
+    dst[i_dst + i0] = (dst_t) bin_op((float) src0[i_src0 + size_t(i0)*s00],
+                                     (float) src1[i_src1 + size_t(i10)*s10]);
+}
+
+bool ggml_cuda_mul_can_batch(const ggml_tensor * node) {
+    return node->op == GGML_OP_MUL &&
+           node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32 &&
+           node->type == GGML_TYPE_F32 &&
+           node->nb[0] == sizeof(float) && node->src[0]->nb[0] == sizeof(float) &&
+           node->src[1]->nb[0] == sizeof(float);
+}
+
+void ggml_cuda_mul_batched(ggml_backend_cuda_context & ctx, const ggml_tensor * proto,
+        const ggml_cuda_binbcast_batch_ptrs & ptrs, int n_batch) {
+    GGML_ASSERT(n_batch >= 1 && n_batch <= CUDA_BINBCAST_BATCH_MAX);
+    GGML_ASSERT(ggml_cuda_mul_can_batch(proto));
+
+    const ggml_tensor * src0 = proto->src[0];
+    const ggml_tensor * src1 = proto->src[1];
+    const ggml_tensor * dst  = proto;
+
+    // same dim-collapse as launch_bin_bcast_pack, specialized to f32
+    int64_t cne[4], cne1[4];
+    size_t  cnb[4], cnb0[4], cnb1[4];
+    for (int k = 0; k < 4; ++k) {
+        cne [k] = dst->ne[k];
+        cne1[k] = src1->ne[k];
+        cnb [k] = dst->nb[k];
+        cnb0[k] = src0->nb[k];
+        cnb1[k] = src1->nb[k];
+    }
+    if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && !ggml_is_permuted(src0) && !ggml_is_permuted(src1)) {
+        for (int k = 0; k < 4; ++k) {
+            if (src1->ne[k] != dst->ne[k]) { // src1 broadcasts on this dim: stop collapsing
+                break;
+            }
+            if (k > 0) {
+                cnb [1] *= cne [1]; cnb [2] *= cne [2]; cnb [3] *= cne [3];
+                cnb0[1] *= cne [1]; cnb0[2] *= cne [2]; cnb0[3] *= cne [3];
+                cnb1[1] *= cne1[1]; cnb1[2] *= cne1[2]; cnb1[3] *= cne1[3];
+                cne [0] *= cne [1]; cne [1] = cne [2]; cne [2] = cne [3]; cne [3] = 1;
+                cne1[0] *= cne1[1]; cne1[1] = cne1[2]; cne1[2] = cne1[3]; cne1[3] = 1;
+            }
+        }
+    }
+
+    const int64_t ne0 = cne[0], ne1 = cne[1], ne2 = cne[2], ne3 = cne[3];
+    for (int k = 0; k < 4; ++k) {
+        GGML_ASSERT(cne[k]  <= std::numeric_limits<uint32_t>::max());
+        GGML_ASSERT(cne1[k] <= std::numeric_limits<uint32_t>::max());
+        GGML_ASSERT(cnb[k] % sizeof(float) == 0 && cnb0[k] % sizeof(float) == 0 && cnb1[k] % sizeof(float) == 0);
+    }
+
+    const int block_size = 128;
+    const int64_t block_num = (ne0 * ne1 * ne2 * ne3 + block_size - 1) / block_size;
+    GGML_ASSERT(block_num <= std::numeric_limits<uint32_t>::max());
+    GGML_ASSERT(ne0 * ne1 * ne2 <= std::numeric_limits<uint32_t>::max());
+
+    const uint3 prod_012 = init_fastdiv_values((uint32_t) (ne0 * ne1 * ne2));
+    const uint3 prod_01  = init_fastdiv_values((uint32_t) (ne0 * ne1));
+    const uint3 ne0_fd   = init_fastdiv_values((uint32_t) ne0);
+    const uint3 ne1_fd   = init_fastdiv_values((uint32_t) ne1);
+    const uint3 ne2_fd   = init_fastdiv_values((uint32_t) ne2);
+    const uint3 ne10_fd  = init_fastdiv_values((uint32_t) cne1[0]);
+    const uint3 ne11_fd  = init_fastdiv_values((uint32_t) cne1[1]);
+    const uint3 ne12_fd  = init_fastdiv_values((uint32_t) cne1[2]);
+    const uint3 ne13_fd  = init_fastdiv_values((uint32_t) cne1[3]);
+
+    const dim3 grid((unsigned) block_num, (unsigned) n_batch, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block_size, 0, ctx.stream());
+
+    ggml_cuda_kernel_launch(k_bin_bcast_unravel_batched<op_mul, float, float, float>, launch_params,
+        ptrs, ne0_fd, ne1_fd, ne2_fd, (uint32_t) ne3, prod_012, prod_01,
+        ne10_fd, ne11_fd, ne12_fd, ne13_fd,
+        (uint32_t) (cnb[1]/sizeof(float)),  (uint32_t) (cnb[2]/sizeof(float)),  (uint32_t) (cnb[3]/sizeof(float)),
+        (uint32_t) (cnb0[0]/sizeof(float)), (uint32_t) (cnb0[1]/sizeof(float)), (uint32_t) (cnb0[2]/sizeof(float)),
+        (uint32_t) (cnb0[3]/sizeof(float)),
+        (uint32_t) (cnb1[0]/sizeof(float)), (uint32_t) (cnb1[1]/sizeof(float)), (uint32_t) (cnb1[2]/sizeof(float)),
+        (uint32_t) (cnb1[3]/sizeof(float)));
+}
+
 template <typename T>
 static __global__ void k_repeat_back(
     const T * __restrict__ src, T * __restrict__ dst, const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
