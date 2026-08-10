@@ -1,5 +1,9 @@
 name: Release
 
+# speed.llama.cpp fork: this upstream workflow builds the full platform
+# matrix (linux/windows/macos, cuda/vulkan/sycl/hip) and publishes a
+# release on every source push to master
+
 on:
   workflow_dispatch: # allows manual triggering
     inputs:
