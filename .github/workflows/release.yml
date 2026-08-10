@@ -180,8 +180,9 @@ jobs:
             os: ubuntu-22.04
           - build: 'arm64'
             os: ubuntu-24.04-arm
-          - build: 's390x'
-            os: ubuntu-24.04-s390x
+          # s390x dropped on this fork: the partner runner queues for hours
+          # and blocks the release job (which needs the full ubuntu-cpu
+          # matrix) for an audience with no mainframe deployments
 
     runs-on: ${{ matrix.os }}
 
