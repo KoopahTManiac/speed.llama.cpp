@@ -947,6 +947,38 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // [q x n_cand, ids x n_cand] rows (see llama_set_spec_verify_draft_dist)
     std::vector<float> dist_buf;
 
+    // per-sequence confidence-scheduler state (params.sched, DSpark paper Alg. 1)
+    struct sched_state {
+        float   ema_acc      = -1.0f; // EMA of realized accepted-per-round (-1 = no observation yet)
+        int32_t skip_left    = 0;     // plain rounds remaining before the next draft probe
+        int32_t gamma        = 0;     // adaptive draft depth for the next round (0 = params.n_max)
+        int32_t last_n_past  = -1;    // n_past at the last drafted round
+        bool    prev_drafted = false; // whether the previous round drafted (arms the EMA update)
+    };
+    std::vector<sched_state> sched_st;
+
+    // Sequential Temperature Scaling (paper 3.2.1): rescale the confidence
+    // head's output on the logit axis by the position's fitted temperature
+    float sts_calibrate(float c, int32_t pos) const {
+        c = std::min(std::max(c, 1e-6f), 1.0f - 1e-6f);
+        if (params.sts.empty()) {
+            return c;
+        }
+        const float T = params.sts[std::min((size_t) pos, params.sts.size() - 1)];
+        return 1.0f / (1.0f + std::exp(-std::log(c / (1.0f - c)) / T));
+    }
+
+    // quantized draft depths: bounds draft-graph shape churn to a few sizes
+    static int32_t sched_quantize_gamma(int32_t want, int32_t n_max) {
+        static const int32_t steps[] = { 2, 4, 6, 8, 12, 16 };
+        for (int32_t s : steps) {
+            if (s >= want) {
+                return std::min(s, n_max);
+            }
+        }
+        return std::min(steps[5], n_max);
+    }
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq)
@@ -980,6 +1012,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
+        if (is_dspark && this->params.sched) {
+            std::string sts_str = "raw";
+            if (!this->params.sts.empty()) {
+                sts_str.clear();
+                for (size_t i = 0; i < this->params.sts.size(); ++i) {
+                    sts_str += (i ? "," : "") + std::to_string(this->params.sts[i]);
+                }
+            }
+            LOG_INF("%s: - sched=on, beta=%.3f, draft_cost=%.3f, probe=%d, sts=%s\n", __func__,
+                    this->params.sched_beta, this->params.sched_draft_cost, this->params.sched_probe, sts_str.c_str());
+        }
+        sched_st.resize(n_seq);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
@@ -1031,6 +1075,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
+
+        sched_st[seq_id] = {};
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1170,6 +1216,41 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             common_sampler_reset(smpls[seq_id].get());
 
+            if (is_dspark && params.sched) {
+                auto & ss = sched_st[seq_id];
+
+                // realized acceptance of the last drafted round, from the
+                // committed-token delta (accepted drafts + 1 bonus token)
+                if (ss.prev_drafted && ss.last_n_past >= 0 && (int32_t) dp.n_past > ss.last_n_past) {
+                    const float acc = (float) ((int32_t) dp.n_past - ss.last_n_past) - 1.0f;
+                    ss.ema_acc = ss.ema_acc < 0.0f ? acc : 0.8f * ss.ema_acc + 0.2f * acc;
+                }
+                ss.prev_drafted = false;
+
+                // skip-drafting: when the acceptance EMA falls below the
+                // throughput-neutral point of the cost model - E[acc] <
+                // beta*gamma + draft_cost - drafting loses to plain decoding;
+                // run sched_probe plain rounds, then probe with a draft round
+                if (ss.skip_left > 0) {
+                    ss.skip_left--;
+                    ss.last_n_past = (int32_t) dp.n_past;
+                    llama_set_spec_verify_draft_dist(params.ctx_tgt, seq_id, nullptr, 0, 0);
+                    continue;
+                }
+                const float gamma_f = (float) (ss.gamma > 0 ? ss.gamma : params.n_max);
+                if (ss.ema_acc >= 0.0f && ss.ema_acc < params.sched_beta * gamma_f + params.sched_draft_cost) {
+                    ss.skip_left    = params.sched_probe;
+                    ss.last_n_past  = (int32_t) dp.n_past;
+                    llama_set_spec_verify_draft_dist(params.ctx_tgt, seq_id, nullptr, 0, 0);
+                    SPC_TRC("sched: seq=%d skip-drafting for %d rounds (ema_acc=%.2f)\n",
+                            (int) seq_id, params.sched_probe, ss.ema_acc);
+                    continue;
+                }
+
+                ss.prev_drafted = true;
+                ss.last_n_past  = (int32_t) dp.n_past;
+            }
+
             if (is_dspark) {
                 // keep the in-graph chain's drafting distribution in sync with
                 // the request's sampling params (values only - no graph rebuild)
@@ -1184,7 +1265,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.n_past;
 
-            const int32_t n_draft = params.n_max;
+            const int32_t n_draft = (is_dspark && params.sched && sched_st[seq_id].gamma > 0)
+                    ? sched_st[seq_id].gamma : params.n_max;
 
             const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
@@ -1239,10 +1321,44 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     dp.result_q->clear();
                 }
 
-                for (int32_t i = 0; i < n_block_tokens; ++i) {
+                // confidence-scheduled admission (paper Alg. 1): calibrate the
+                // head's conditional acceptance estimates (STS), form the
+                // prefix-survival products a_k = prod c'_i, and admit the
+                // prefix maximizing expected round throughput
+                //   theta_l = (1 + sum_{k<=l} a_k) / (1 + beta*l),
+                // scanning left to right and stopping at the first decline -
+                // the causal early stop that keeps admission independent of
+                // later positions (the draft block cost is sunk here; it
+                // enters the skip-drafting decision instead)
+                int32_t n_admit = n_block_tokens;
+                if (params.sched) {
+                    float a_prod = 1.0f;
+                    float sum_a  = 0.0f;
+                    float best   = 1.0f;
+                    n_admit = 0;
+                    for (int32_t i = 0; i < n_block_tokens; ++i) {
+                        const size_t row = (size_t) (beg + i) * n_embd_dec;
+                        a_prod *= sts_calibrate(xtra[row + LLAMA_DSPARK_NEXTN_ROW_CONF], i);
+                        sum_a  += a_prod;
+                        const float theta = (1.0f + sum_a) / (1.0f + params.sched_beta * (float) (i + 1));
+                        if (theta <= best) {
+                            break;
+                        }
+                        best    = theta;
+                        n_admit = i + 1;
+                    }
+                    // adapt the next round's draft depth to the admitted
+                    // prefix plus headroom - deep blocks on easy content,
+                    // cheap short blocks on hard content
+                    sched_st[seq_id].gamma = sched_quantize_gamma(n_admit + 2, params.n_max);
+                    SPC_TRC("sched: seq=%d admit=%d/%d gamma_next=%d ema_acc=%.2f\n",
+                            (int) seq_id, n_admit, n_block_tokens, sched_st[seq_id].gamma, sched_st[seq_id].ema_acc);
+                }
+
+                for (int32_t i = 0; i < (params.sched ? n_admit : n_block_tokens); ++i) {
                     const size_t row = (size_t) (beg + i) * n_embd_dec;
 
-                    if (params.p_min > 0.0f && xtra[row + LLAMA_DSPARK_NEXTN_ROW_CONF] < params.p_min) {
+                    if (!params.sched && params.p_min > 0.0f && xtra[row + LLAMA_DSPARK_NEXTN_ROW_CONF] < params.p_min) {
                         break;
                     }
 

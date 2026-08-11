@@ -4030,6 +4030,59 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
+        {"--spec-sched"},
+        string_format("confidence-scheduled DSpark drafting: per-round draft admission by expected-throughput "
+                      "maximization, adaptive draft depth and skip-drafting on low-acceptance content (default: %s)",
+                      params.speculative.draft.sched ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.speculative.draft.sched = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SCHED"));
+    add_opt(common_arg(
+        {"--spec-sts"}, "T0,T1,...",
+        "sequential temperature scaling for the DSpark confidence head: per-position temperatures, "
+        "last value broadcasts deeper (default: none = raw confidences)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.sts.clear();
+            for (size_t beg = 0; beg < value.size();) {
+                size_t end = value.find(',', beg);
+                if (end == std::string::npos) {
+                    end = value.size();
+                }
+                const float t = std::stof(value.substr(beg, end - beg));
+                if (t <= 0.0f) {
+                    throw std::invalid_argument("--spec-sts temperatures must be > 0");
+                }
+                params.speculative.draft.sts.push_back(t);
+                beg = end + 1;
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_STS"));
+    add_opt(common_arg(
+        {"--spec-sched-beta"}, "F",
+        string_format("scheduler cost model: marginal verify cost of one extra draft token, relative to a "
+                      "1-token target round (default: %.3f)", (double)params.speculative.draft.sched_beta),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.sched_beta = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SCHED_BETA"));
+    add_opt(common_arg(
+        {"--spec-sched-draft-cost"}, "F",
+        string_format("scheduler cost model: draft block cost relative to a 1-token target round; drives "
+                      "skip-drafting (default: %.3f)", (double)params.speculative.draft.sched_draft_cost),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.sched_draft_cost = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SCHED_DRAFT_COST"));
+    add_opt(common_arg(
+        {"--spec-sched-probe"}, "N",
+        string_format("plain rounds between draft probes while skip-drafting (default: %d)",
+                      params.speculative.draft.sched_probe),
+        [](common_params & params, int value) {
+            params.speculative.draft.sched_probe = std::max(1, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SCHED_PROBE"));
+    add_opt(common_arg(
         {"--spec-draft-dspark-n-cand"}, "N",
         "candidate-set capacity of DSpark's in-graph sampled chain "
         "(default: -1 = derive from the sampling top-k, 0 = draft greedily)",

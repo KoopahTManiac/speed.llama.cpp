@@ -332,6 +332,20 @@ struct common_params_speculative_draft {
     // (-1 - derive from the configured sampling top-k, 0 - disable, draft greedily)
     int32_t dspark_n_cand = -1;
 
+    // DSpark confidence-scheduled drafting (arXiv DSpark paper, Alg. 1):
+    // per-round draft admission by expected-throughput maximization over the
+    // calibrated prefix-survival probabilities, adaptive next-round draft
+    // depth, and skip-drafting on persistently low-acceptance content.
+    bool  sched            = false;
+    float sched_beta       = 0.02f; // marginal verify cost of one extra draft token, relative to a 1-token target round
+    float sched_draft_cost = 0.25f; // draft block cost relative to a 1-token target round (drives skip-drafting)
+    int32_t sched_probe    = 8;     // plain rounds between draft probes while skipping
+
+    // Sequential Temperature Scaling (paper 3.2.1): per-position temperatures
+    // applied to the raw confidence head outputs; empty = uncalibrated (T=1).
+    // The last value broadcasts to any deeper positions.
+    std::vector<float> sts;
+
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     common_params_model mparams;
