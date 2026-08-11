@@ -21,7 +21,7 @@ substantially faster and adds exact sampled acceptance:
 **Measured** (Qwen3.6-35B-A3B NVFP4 target + [DSPARK v2
 draft](https://huggingface.co/Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK-v2-GGUF),
 RTX PRO 6000 Blackwell, single user, 1024-token generations at temp 0.7):
-**506 tok/s** vs 352 on the upstream base (**+44%**) — ~87% of vLLM 0.26
+**506 tok/s** vs 278 on the upstream base (**+82%**) — ~87% of vLLM 0.26
 serving the same model + draft on the same GPU, while plain
 non-speculative decoding is ~9% *faster* than vLLM's. Details, model
 cards and deployment notes:
