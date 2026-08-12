@@ -1039,6 +1039,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             sps_t[n - 1] = best;
         }
         llama_batch_free(pb);
+        // enforce a non-decreasing curve: single-size timing outliers (seen
+        // on Windows: size 1 measured above size 2) otherwise skew the cost
+        // model; pull outliers DOWN to the cheaper larger size
+        for (int32_t i = n_probe - 2; i >= 0; --i) {
+            sps_t[i] = std::min(sps_t[i], sps_t[i + 1]);
+        }
         std::string curve;
         for (int32_t n = 1; n <= n_probe; ++n) {
             curve += string_format("%s%.2f", n > 1 ? "," : "", sps_t[n - 1] * 1e3f);
@@ -1100,6 +1106,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }();
         std::vector<std::pair<float, float>> pl(n); // (pred, label) scratch
         for (int32_t k = 0; k < bs; ++k) {
+            // fit a position only when both outcome classes are represented
+            // well enough; otherwise identity (a handful of deep-position
+            // survivals otherwise produces extreme temperatures)
+            int32_t n_pos = 0;
+            for (int32_t r = 0; r < n; ++r) {
+                n_pos += cal_acc[ring(r)] > k ? 1 : 0;
+            }
+            if (std::min(n_pos, n - n_pos) < 32) {
+                temps.push_back(1.0f);
+                continue;
+            }
             float best_T = 1.0f, best_e = 1e9f;
             for (const float T : grid) {
                 for (int32_t r = 0; r < n; ++r) {
@@ -1128,6 +1145,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     best_T = T;
                 }
             }
+            // shrink early fits geometrically toward identity: small windows
+            // produce noisy temperatures, and a bad temperature costs real
+            // throughput (measured -9% from an early-fit outlier)
+            const float w = (float) n / ((float) n + 768.0f);
+            best_T = std::pow(best_T, w);
             temps.push_back(best_T);
             for (int32_t r = 0; r < n; ++r) {
                 float c = std::min(std::max(cal_conf[ring(r) * bs + k], 1e-6f), 1.0f - 1e-6f);
@@ -1151,7 +1173,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (!f) {
             return;
         }
-        const uint32_t magic = 0x53505343, version = 1; // "SPSC"
+        const uint32_t magic = 0x53505343, version = 2; // "SPSC"; v2: shrunk/class-floored fits (v1 caches carried noisy temps)
         const uint32_t n_sts = (uint32_t) sts_active.size();
         fwrite(&magic,   4, 1, f);
         fwrite(&version, 4, 1, f);
@@ -1172,7 +1194,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         uint32_t magic = 0, version = 0, n_sts = 0;
         bool ok = fread(&magic, 4, 1, f) == 1 && magic == 0x53505343 &&
-                  fread(&version, 4, 1, f) == 1 && version == 1 &&
+                  fread(&version, 4, 1, f) == 1 && version == 2 &&
                   fread(&n_sts, 4, 1, f) == 1 && n_sts <= 64;
         if (ok) {
             std::vector<float> temps(n_sts);
@@ -1709,6 +1731,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // and stopping at the first decline - the causal early stop
                 // that keeps admission independent of later positions
                 int32_t n_admit = n_block_tokens;
+                // until a calibration exists (user-supplied, cached, or fitted
+                // this session), admit everything: raw confidences are
+                // systematically pessimistic and cold-start truncation is pure
+                // loss (measured -35% on a cold 5090); same convention as
+                // sglang's flat-SPS "verify-all" default. Data collection
+                // continues below either way, so the first fit still arrives.
+                const bool sched_calibrated = !sts_active.empty();
                 if (params.sched) {
                     auto & ss = sched_st[seq_id];
                     ss.last_conf.resize(n_block_tokens);
@@ -1732,13 +1761,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         a_prod *= sts_calibrate(c, i);
                         sum_a  += a_prod;
                         const float theta = theta_at(i + 1, 1.0f + sum_a);
-                        if (theta <= best) {
+                        // margin on the causal early stop: truncation must
+                        // promise a MEANINGFUL throughput gain - near-flat
+                        // theta curves admit everything (any truncation there
+                        // trades real accepted tokens for noise-level savings)
+                        if (theta <= best * 0.96f) {
                             break;
                         }
-                        best    = theta;
-                        n_admit = i + 1;
+                        if (theta > best) {
+                            best    = theta;
+                            n_admit = i + 1;
+                        }
                     }
-                    if (params.sched_adapt) {
+                    if (n_admit < n_block_tokens &&
+                        theta_at(n_block_tokens, 1.0f + sum_a) > best * 0.96f) {
+                        // the full block is within the margin of the interior
+                        // argmax: prefer full admission (stable shape, no
+                        // accepted-token loss)
+                        n_admit = n_block_tokens;
+                    }
+                    if (!sched_calibrated) {
+                        n_admit = n_block_tokens;
+                    }
+                    if (params.sched_adapt && sched_calibrated) {
                         // non-paper extensions: adapt the next round's draft
                         // depth to the admitted prefix plus headroom, and
                         // stabilize the verify-batch shape (round admission
