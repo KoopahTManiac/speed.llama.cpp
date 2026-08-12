@@ -341,10 +341,14 @@ struct common_params_speculative_draft {
     float sched_draft_cost = 0.25f; // draft block cost relative to a 1-token target round (drives skip-drafting)
     int32_t sched_probe    = 8;     // plain rounds between draft probes while skipping
 
-    // Sequential Temperature Scaling (paper 3.2.1): per-position temperatures
-    // applied to the raw confidence head outputs; empty = uncalibrated (T=1).
-    // The last value broadcasts to any deeper positions.
+    // Sequential Temperature Scaling (paper 3.2.1), extended with a logit
+    // bias: c' = sigmoid(logit(c)/T + b). The bias absorbs the systematic
+    // shift between the head's training game (temp-1.0 full-vocab TV labels)
+    // and the serving game (temperature + truncation), which raises realized
+    // acceptance above the raw estimates - a shift temperature alone cannot
+    // express. Empty = uncalibrated (T=1, b=0); last value broadcasts deeper.
     std::vector<float> sts;
+    std::vector<float> sts_bias;
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 

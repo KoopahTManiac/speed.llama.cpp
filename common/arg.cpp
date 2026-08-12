@@ -4059,6 +4059,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_STS"));
     add_opt(common_arg(
+        {"--spec-sts-bias"}, "B0,B1,...",
+        "logit bias added to the DSpark confidence head per position (after temperature), "
+        "last value broadcasts deeper (default: none = 0)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.sts_bias.clear();
+            for (size_t beg = 0; beg < value.size();) {
+                size_t end = value.find(',', beg);
+                if (end == std::string::npos) {
+                    end = value.size();
+                }
+                params.speculative.draft.sts_bias.push_back(std::stof(value.substr(beg, end - beg)));
+                beg = end + 1;
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_STS_BIAS"));
+    add_opt(common_arg(
         {"--spec-sched-beta"}, "F",
         string_format("scheduler cost model: marginal verify cost of one extra draft token, relative to a "
                       "1-token target round (default: %.3f)", (double)params.speculative.draft.sched_beta),

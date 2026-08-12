@@ -957,26 +957,50 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     };
     std::vector<sched_state> sched_st;
 
-    // Sequential Temperature Scaling (paper 3.2.1): rescale the confidence
-    // head's output on the logit axis by the position's fitted temperature
+    // Sequential Temperature Scaling (paper 3.2.1) with logit bias:
+    // c' = sigmoid(logit(c)/T + b). The bias lifts the head's systematically
+    // pessimistic estimates into the serving game's acceptance scale.
     float sts_calibrate(float c, int32_t pos) const {
         c = std::min(std::max(c, 1e-6f), 1.0f - 1e-6f);
-        if (params.sts.empty()) {
+        if (params.sts.empty() && params.sts_bias.empty()) {
             return c;
         }
-        const float T = params.sts[std::min((size_t) pos, params.sts.size() - 1)];
-        return 1.0f / (1.0f + std::exp(-std::log(c / (1.0f - c)) / T));
+        float z = std::log(c / (1.0f - c));
+        if (!params.sts.empty()) {
+            z /= params.sts[std::min((size_t) pos, params.sts.size() - 1)];
+        }
+        if (!params.sts_bias.empty()) {
+            z += params.sts_bias[std::min((size_t) pos, params.sts_bias.size() - 1)];
+        }
+        return 1.0f / (1.0f + std::exp(-z));
     }
 
     // quantized draft depths: bounds draft-graph shape churn to a few sizes
     static int32_t sched_quantize_gamma(int32_t want, int32_t n_max) {
-        static const int32_t steps[] = { 2, 4, 6, 8, 12, 16 };
+        static const int32_t steps[] = { 4, 8, 16 };
         for (int32_t s : steps) {
             if (s >= want) {
                 return std::min(s, n_max);
             }
         }
-        return std::min(steps[5], n_max);
+        return std::min(steps[2], n_max);
+    }
+
+    // round the admitted length UP to a small size grid: extra verify tokens
+    // are near-free at low batch, but a stable verify-batch shape keeps the
+    // target graph on the reuse fast path (measured: per-round shape changes
+    // cost more than deep-tail verification saves)
+    static int32_t sched_quantize_admit(int32_t admit, int32_t n_block) {
+        if (admit <= 0) {
+            return 0;
+        }
+        static const int32_t steps[] = { 4, 8, 12, 16 };
+        for (int32_t s : steps) {
+            if (s >= admit) {
+                return std::min(s, n_block);
+            }
+        }
+        return n_block;
     }
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
@@ -1020,8 +1044,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     sts_str += (i ? "," : "") + std::to_string(this->params.sts[i]);
                 }
             }
-            LOG_INF("%s: - sched=on, beta=%.3f, draft_cost=%.3f, probe=%d, sts=%s\n", __func__,
-                    this->params.sched_beta, this->params.sched_draft_cost, this->params.sched_probe, sts_str.c_str());
+            std::string bias_str = "0";
+            if (!this->params.sts_bias.empty()) {
+                bias_str.clear();
+                for (size_t i = 0; i < this->params.sts_bias.size(); ++i) {
+                    bias_str += (i ? "," : "") + std::to_string(this->params.sts_bias[i]);
+                }
+            }
+            LOG_INF("%s: - sched=on, beta=%.3f, draft_cost=%.3f, probe=%d, sts=%s, sts_bias=%s\n", __func__,
+                    this->params.sched_beta, this->params.sched_draft_cost, this->params.sched_probe,
+                    sts_str.c_str(), bias_str.c_str());
         }
         sched_st.resize(n_seq);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
@@ -1351,6 +1383,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     // prefix plus headroom - deep blocks on easy content,
                     // cheap short blocks on hard content
                     sched_st[seq_id].gamma = sched_quantize_gamma(n_admit + 2, params.n_max);
+
+                    // stabilize the verify-batch shape (round admission up,
+                    // never down: only adds cheap verify tokens)
+                    n_admit = sched_quantize_admit(n_admit, n_block_tokens);
                     SPC_TRC("sched: seq=%d admit=%d/%d gamma_next=%d ema_acc=%.2f\n",
                             (int) seq_id, n_admit, n_block_tokens, sched_st[seq_id].gamma, sched_st[seq_id].ema_acc);
                 }
