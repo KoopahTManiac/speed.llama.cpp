@@ -1240,15 +1240,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            auto & dp = dparams[seq_id];
-            if (!dp.drafting) {
-                continue;
-            }
-
-            common_sampler_reset(smpls[seq_id].get());
-
-            if (is_dspark && params.sched) {
+        // scheduler pre-pass: per-seq skip decisions plus a COMMON draft depth
+        // for this round - the dspark markov head asserts equal-size blocks
+        // across the batch (n_tok % n_blocks == 0), so ragged per-seq depths
+        // must be unified; max() is safe (admission still truncates per seq,
+        // extra depth costs draft compute only)
+        std::vector<bool> sched_skip(n_seq, false);
+        int32_t gamma_common = 0;
+        if (is_dspark && params.sched) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                auto & dp = dparams[seq_id];
+                if (!dp.drafting) {
+                    continue;
+                }
                 auto & ss = sched_st[seq_id];
 
                 // realized acceptance of the last drafted round, from the
@@ -1267,6 +1271,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     ss.skip_left--;
                     ss.last_n_past = (int32_t) dp.n_past;
                     llama_set_spec_verify_draft_dist(params.ctx_tgt, seq_id, nullptr, 0, 0);
+                    sched_skip[seq_id] = true;
                     continue;
                 }
                 const float gamma_f = (float) (ss.gamma > 0 ? ss.gamma : params.n_max);
@@ -1276,12 +1281,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     llama_set_spec_verify_draft_dist(params.ctx_tgt, seq_id, nullptr, 0, 0);
                     SPC_TRC("sched: seq=%d skip-drafting for %d rounds (ema_acc=%.2f)\n",
                             (int) seq_id, params.sched_probe, ss.ema_acc);
+                    sched_skip[seq_id] = true;
                     continue;
                 }
 
                 ss.prev_drafted = true;
                 ss.last_n_past  = (int32_t) dp.n_past;
+                gamma_common = std::max(gamma_common, ss.gamma > 0 ? ss.gamma : params.n_max);
             }
+        }
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+            if (is_dspark && params.sched && sched_skip[seq_id]) {
+                continue;
+            }
+
+            common_sampler_reset(smpls[seq_id].get());
 
             if (is_dspark) {
                 // keep the in-graph chain's drafting distribution in sync with
@@ -1297,8 +1316,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.n_past;
 
-            const int32_t n_draft = (is_dspark && params.sched && sched_st[seq_id].gamma > 0)
-                    ? sched_st[seq_id].gamma : params.n_max;
+            const int32_t n_draft = (is_dspark && params.sched && gamma_common > 0)
+                    ? gamma_common : params.n_max;
 
             const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;

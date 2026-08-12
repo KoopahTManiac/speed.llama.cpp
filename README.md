@@ -17,6 +17,16 @@ substantially faster and adds exact sampled acceptance:
   launches, occupancy-derived GEMV/GEMM dispatch gates, pinned staging for
   host copies
 - host-path fixes: deferred sampler clone, batch-init scan guard
+- **confidence-scheduled drafting** (`--spec-sched`, off by default):
+  the DSpark paper's Alg. 1 — throughput-maximizing draft admission over
+  the trained confidence head, adaptive draft depth, and skip-drafting on
+  persistently low-acceptance content — with confidence calibration via
+  `--spec-sts` / `--spec-sts-bias` (start with `--spec-sts-bias 1.5`).
+  Single-user tool for regimes where fixed-depth speculation loses to
+  plain decoding (very long contexts, hard content); measured parity on
+  structured content at bs1. Leave OFF for batched serving: the server's
+  host loop, not verify compute, is the batch ceiling, so admission
+  truncation only reduces accepted length there.
 
 **Measured** (Qwen3.6-35B-A3B NVFP4 target + [DSPARK v2
 draft](https://huggingface.co/Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK-v2-GGUF),
