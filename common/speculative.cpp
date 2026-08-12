@@ -954,8 +954,95 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         int32_t gamma        = 0;     // adaptive draft depth for the next round (0 = params.n_max)
         int32_t last_n_past  = -1;    // n_past at the last drafted round
         bool    prev_drafted = false; // whether the previous round drafted (arms the EMA update)
+        std::vector<float> last_conf; // raw confidences of the last drafted round (conf logging)
     };
     std::vector<sched_state> sched_st;
+
+    // profiled SPS capacity curve (paper 3.2.2): sps_t[n-1] = measured target
+    // decode latency at verify-batch size n, probed at startup. Empty when the
+    // analytic override (sched_beta > 0) is active.
+    std::vector<float> sps_t;
+    FILE * conf_log = nullptr;
+
+    // end-to-end round cost model, estimated online from single-sequence
+    // rounds:  t_round = F + dec(verify size) + c_tok * emitted_tokens.
+    // dec() is the boot-profiled decode curve; (F, c_tok) come from EMA
+    // regression of (wall time - dec) on emitted tokens. Charging the
+    // per-emitted-token cost to the EXPECTED tokens in Theta - instead of
+    // folding it into per-size buckets - avoids the success-penalizing
+    // feedback of naive e2e buckets (deep admissions emit more tokens,
+    // inflating their size's bucket and spiraling admission down).
+    float   reg_m = 0.0f, reg_y = 0.0f, reg_mm = 0.0f, reg_my = 0.0f;
+    int32_t reg_n = 0;
+    float   c_tok = 0.0f;  // per-emitted-token cost (s)
+    float   t_fix = -1.0f; // per-round fixed cost (s), regression estimate
+    float   sched_overhead_s = -1.0f; // constant-overhead fallback until the regression warms
+    int64_t prev_round_us    = 0;
+    int32_t prev_verify_idx  = -1;
+
+    // fixed round cost (excluding decode and per-token terms)
+    float sched_t_fixed() const {
+        if (t_fix > 0.0f) {
+            return t_fix;
+        }
+        return sched_overhead_s > 0.0f ? sched_overhead_s : 0.0f;
+    }
+
+    // seconds per round at verify size l+1 ignoring the per-token term (used
+    // by the adapt-mode skip threshold); analytic model when not profiled
+    float sched_round_t(int32_t l) const {
+        if (!sps_t.empty()) {
+            return sched_t_fixed() + sps_t[std::min((size_t) l, sps_t.size() - 1)];
+        }
+        return 1.0f + params.sched_beta * (float) l;
+    }
+
+    // the paper's hardware profiling: measure real target decode latency at
+    // every verify-batch size 1..n_probe on a scratch sequence, min of reps
+    void sched_profile_sps(int32_t n_probe) {
+        auto * ctx_tgt = params.ctx_tgt;
+        const llama_model * model = llama_get_model(ctx_tgt);
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        llama_token tok = llama_vocab_bos(vocab);
+        if (tok == LLAMA_TOKEN_NULL) {
+            tok = 0;
+        }
+        llama_batch pb = llama_batch_init(n_probe, 0, 1);
+        sps_t.assign(n_probe, 0.0f);
+        for (int32_t n = 1; n <= n_probe; ++n) {
+            float best = 0.0f;
+            for (int32_t rep = 0; rep < 4; ++rep) {
+                common_batch_clear(pb);
+                for (int32_t i = 0; i < n; ++i) {
+                    common_batch_add(pb, tok, i, { 0 }, false);
+                }
+                llama_synchronize(ctx_tgt);
+                const int64_t t0 = ggml_time_us();
+                const int rc = llama_decode(ctx_tgt, pb);
+                llama_synchronize(ctx_tgt);
+                const int64_t t1 = ggml_time_us();
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, 0, -1);
+                if (rc != 0) {
+                    LOG_WRN("%s: SPS probe decode failed (n=%d rc=%d) - falling back to analytic model\n",
+                            __func__, n, rc);
+                    llama_batch_free(pb);
+                    sps_t.clear();
+                    return;
+                }
+                const float dt = (float) (t1 - t0) * 1e-6f;
+                if (rep > 0) { // rep 0 warms graph/alloc for this shape
+                    best = best == 0.0f ? dt : std::min(best, dt);
+                }
+            }
+            sps_t[n - 1] = best;
+        }
+        llama_batch_free(pb);
+        std::string curve;
+        for (int32_t n = 1; n <= n_probe; ++n) {
+            curve += string_format("%s%.2f", n > 1 ? "," : "", sps_t[n - 1] * 1e3f);
+        }
+        LOG_INF("%s: profiled SPS latency curve (ms, verify size 1..%d): %s\n", __func__, n_probe, curve.c_str());
+    }
 
     // Sequential Temperature Scaling (paper 3.2.1) with logit bias:
     // c' = sigmoid(logit(c)/T + b). The bias lifts the head's systematically
@@ -1051,9 +1138,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     bias_str += (i ? "," : "") + std::to_string(this->params.sts_bias[i]);
                 }
             }
-            LOG_INF("%s: - sched=on, beta=%.3f, draft_cost=%.3f, probe=%d, sts=%s, sts_bias=%s\n", __func__,
+            LOG_INF("%s: - sched=on, adapt=%s, beta=%.3f, draft_cost=%.3f, probe=%d, sts=%s, sts_bias=%s\n", __func__,
+                    this->params.sched_adapt ? "on" : "off",
                     this->params.sched_beta, this->params.sched_draft_cost, this->params.sched_probe,
                     sts_str.c_str(), bias_str.c_str());
+            if (this->params.sched_beta <= 0.0f) {
+                sched_profile_sps(this->params.n_max + 1);
+            }
+            if (!this->params.sched_conf_log.empty()) {
+                conf_log = fopen(this->params.sched_conf_log.c_str(), "a");
+                if (!conf_log) {
+                    LOG_WRN("%s: cannot open --spec-conf-log file '%s'\n", __func__,
+                            this->params.sched_conf_log.c_str());
+                }
+            }
         }
         sched_st.resize(n_seq);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
@@ -1101,6 +1199,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     ~common_speculative_impl_draft_dflash() override {
         llama_batch_free(batch);
         llama_batch_free(batch_inject);
+        if (conf_log) {
+            fclose(conf_log);
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1240,6 +1341,53 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
+        // online round-overhead refinement (single active sequence only): the
+        // interval between draft() entries is one full round; subtracting the
+        // profiled decode share of the previous round's verify size leaves
+        // the constant overhead (draft forward + host loop)
+        if (is_dspark && params.sched && !sps_t.empty()) {
+            const int64_t now = ggml_time_us();
+            int32_t n_drafting = 0;
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                n_drafting += dparams[s].drafting ? 1 : 0;
+            }
+            if (n_drafting == 1 && prev_round_us > 0 && prev_verify_idx >= 0) {
+                const float  dt = (float) (now - prev_round_us) * 1e-6f;
+                const size_t pi = std::min((size_t) prev_verify_idx, sps_t.size() - 1);
+                // emitted tokens of the previous round (accepted + bonus),
+                // read before the pre-pass refreshes last_n_past
+                float m = -1.0f;
+                for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                    const auto & ss = sched_st[s];
+                    if (dparams[s].drafting && ss.prev_drafted && ss.last_n_past >= 0 &&
+                        (int32_t) dparams[s].n_past > ss.last_n_past) {
+                        m = (float) ((int32_t) dparams[s].n_past - ss.last_n_past);
+                        break;
+                    }
+                }
+                const float y = dt - sps_t[pi];
+                if (dt < 1.0f && m >= 1.0f && y > 0.0f) { // ignore stalls (request gaps)
+                    // constant-overhead fallback (biased by the per-token
+                    // term, but stable) until the regression warms
+                    sched_overhead_s = sched_overhead_s < 0.0f ? y : 0.9f * sched_overhead_s + 0.1f * y;
+                    const float r = 0.05f;
+                    reg_m  = (1 - r) * reg_m  + r * m;
+                    reg_y  = (1 - r) * reg_y  + r * y;
+                    reg_mm = (1 - r) * reg_mm + r * m * m;
+                    reg_my = (1 - r) * reg_my + r * m * y;
+                    reg_n++;
+                    const float var = reg_mm - reg_m * reg_m;
+                    if (reg_n >= 64 && var > 0.5f) {
+                        const float c = (reg_my - reg_m * reg_y) / var;
+                        c_tok = std::min(std::max(c, 0.0f), 0.01f);
+                        t_fix = std::max(reg_y - c_tok * reg_m, 0.0f);
+                    }
+                }
+            }
+            prev_round_us   = now;
+            prev_verify_idx = -1; // set after admission when exactly one seq drafted
+        }
+
         // scheduler pre-pass: per-seq skip decisions plus a COMMON draft depth
         // for this round - the dspark markov head asserts equal-size blocks
         // across the batch (n_tok % n_blocks == 0), so ragged per-seq depths
@@ -1260,34 +1408,50 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (ss.prev_drafted && ss.last_n_past >= 0 && (int32_t) dp.n_past > ss.last_n_past) {
                     const float acc = (float) ((int32_t) dp.n_past - ss.last_n_past) - 1.0f;
                     ss.ema_acc = ss.ema_acc < 0.0f ? acc : 0.8f * ss.ema_acc + 0.2f * acc;
+
+                    // STS fitting data: raw confidences of that round paired
+                    // with its realized accepted length
+                    if (conf_log && !ss.last_conf.empty()) {
+                        fprintf(conf_log, "%d", (int) acc);
+                        for (const float c : ss.last_conf) {
+                            fprintf(conf_log, " %.5f", c);
+                        }
+                        fputc('\n', conf_log);
+                    }
                 }
                 ss.prev_drafted = false;
+                ss.last_conf.clear();
 
-                // skip-drafting: when the acceptance EMA falls below the
-                // throughput-neutral point of the cost model - E[acc] <
-                // beta*gamma + draft_cost - drafting loses to plain decoding;
-                // run sched_probe plain rounds, then probe with a draft round
-                if (ss.skip_left > 0) {
-                    ss.skip_left--;
-                    ss.last_n_past = (int32_t) dp.n_past;
-                    llama_set_spec_verify_draft_dist(params.ctx_tgt, seq_id, nullptr, 0, 0);
-                    sched_skip[seq_id] = true;
-                    continue;
-                }
-                const float gamma_f = (float) (ss.gamma > 0 ? ss.gamma : params.n_max);
-                if (ss.ema_acc >= 0.0f && ss.ema_acc < params.sched_beta * gamma_f + params.sched_draft_cost) {
-                    ss.skip_left    = params.sched_probe;
-                    ss.last_n_past  = (int32_t) dp.n_past;
-                    llama_set_spec_verify_draft_dist(params.ctx_tgt, seq_id, nullptr, 0, 0);
-                    SPC_TRC("sched: seq=%d skip-drafting for %d rounds (ema_acc=%.2f)\n",
-                            (int) seq_id, params.sched_probe, ss.ema_acc);
-                    sched_skip[seq_id] = true;
-                    continue;
+                // skip-drafting (non-paper, sched_adapt): when the acceptance
+                // EMA falls below the throughput-neutral point - E[acc] <
+                // (round_t(gamma)/round_t(0) - 1) + draft_cost - drafting
+                // loses to plain decoding; run sched_probe plain rounds, then
+                // probe with a draft round
+                if (params.sched_adapt) {
+                    if (ss.skip_left > 0) {
+                        ss.skip_left--;
+                        ss.last_n_past = (int32_t) dp.n_past;
+                        llama_set_spec_verify_draft_dist(params.ctx_tgt, seq_id, nullptr, 0, 0);
+                        sched_skip[seq_id] = true;
+                        continue;
+                    }
+                    const int32_t gamma_i = ss.gamma > 0 ? ss.gamma : params.n_max;
+                    const float over = sched_round_t(gamma_i) / sched_round_t(0) - 1.0f;
+                    if (ss.ema_acc >= 0.0f && ss.ema_acc < over + params.sched_draft_cost) {
+                        ss.skip_left    = params.sched_probe;
+                        ss.last_n_past  = (int32_t) dp.n_past;
+                        llama_set_spec_verify_draft_dist(params.ctx_tgt, seq_id, nullptr, 0, 0);
+                        SPC_TRC("sched: seq=%d skip-drafting for %d rounds (ema_acc=%.2f)\n",
+                                (int) seq_id, params.sched_probe, ss.ema_acc);
+                        sched_skip[seq_id] = true;
+                        continue;
+                    }
                 }
 
                 ss.prev_drafted = true;
                 ss.last_n_past  = (int32_t) dp.n_past;
-                gamma_common = std::max(gamma_common, ss.gamma > 0 ? ss.gamma : params.n_max);
+                gamma_common = std::max(gamma_common,
+                        (params.sched_adapt && ss.gamma > 0) ? ss.gamma : params.n_max);
             }
         }
 
@@ -1376,38 +1540,64 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // head's conditional acceptance estimates (STS), form the
                 // prefix-survival products a_k = prod c'_i, and admit the
                 // prefix maximizing expected round throughput
-                //   theta_l = (1 + sum_{k<=l} a_k) / (1 + beta*l),
-                // scanning left to right and stopping at the first decline -
-                // the causal early stop that keeps admission independent of
-                // later positions (the draft block cost is sunk here; it
-                // enters the skip-drafting decision instead)
+                //   theta_l = (1 + sum_{k<=l} a_k) * SPS(l+1)
+                // against the profiled capacity curve, scanning left to right
+                // and stopping at the first decline - the causal early stop
+                // that keeps admission independent of later positions
                 int32_t n_admit = n_block_tokens;
                 if (params.sched) {
+                    auto & ss = sched_st[seq_id];
+                    if (conf_log) {
+                        ss.last_conf.resize(n_block_tokens);
+                    }
+                    // theta_l = E[tokens] / E[round time] with the profiled
+                    // three-component cost: fixed + decode(size) + per-token
+                    const bool  prof   = !sps_t.empty();
+                    const float t_f    = prof ? sched_t_fixed() : 0.0f;
+                    auto theta_at = [&](int32_t l, float exp_tok) {
+                        const float dec = prof ? sps_t[std::min((size_t) l, sps_t.size() - 1)]
+                                               : 1.0f + params.sched_beta * (float) l;
+                        return exp_tok / (t_f + dec + (prof ? c_tok * exp_tok : 0.0f));
+                    };
                     float a_prod = 1.0f;
                     float sum_a  = 0.0f;
-                    float best   = 1.0f;
+                    float best   = theta_at(0, 1.0f);
                     n_admit = 0;
                     for (int32_t i = 0; i < n_block_tokens; ++i) {
                         const size_t row = (size_t) (beg + i) * n_embd_dec;
-                        a_prod *= sts_calibrate(xtra[row + LLAMA_DSPARK_NEXTN_ROW_CONF], i);
+                        const float  c   = xtra[row + LLAMA_DSPARK_NEXTN_ROW_CONF];
+                        if (conf_log) {
+                            ss.last_conf[i] = c;
+                        }
+                        a_prod *= sts_calibrate(c, i);
                         sum_a  += a_prod;
-                        const float theta = (1.0f + sum_a) / (1.0f + params.sched_beta * (float) (i + 1));
+                        const float theta = theta_at(i + 1, 1.0f + sum_a);
                         if (theta <= best) {
                             break;
                         }
                         best    = theta;
                         n_admit = i + 1;
                     }
-                    // adapt the next round's draft depth to the admitted
-                    // prefix plus headroom - deep blocks on easy content,
-                    // cheap short blocks on hard content
-                    sched_st[seq_id].gamma = sched_quantize_gamma(n_admit + 2, params.n_max);
-
-                    // stabilize the verify-batch shape (round admission up,
-                    // never down: only adds cheap verify tokens)
-                    n_admit = sched_quantize_admit(n_admit, n_block_tokens);
-                    SPC_TRC("sched: seq=%d admit=%d/%d gamma_next=%d ema_acc=%.2f\n",
-                            (int) seq_id, n_admit, n_block_tokens, sched_st[seq_id].gamma, sched_st[seq_id].ema_acc);
+                    if (params.sched_adapt) {
+                        // non-paper extensions: adapt the next round's draft
+                        // depth to the admitted prefix plus headroom, and
+                        // stabilize the verify-batch shape (round admission
+                        // up, never down: only adds cheap verify tokens)
+                        ss.gamma = sched_quantize_gamma(n_admit + 2, params.n_max);
+                        n_admit  = sched_quantize_admit(n_admit, n_block_tokens);
+                    }
+                    // conf logging pairs the FULL block's confidences with the
+                    // realized outcome, so log rounds must verify the full
+                    // block to observe deep positions
+                    if (conf_log) {
+                        n_admit = n_block_tokens;
+                    }
+                    // feed the online overhead estimator (valid only when this
+                    // was the round's single drafting sequence)
+                    prev_verify_idx = prev_verify_idx == -1 ? n_admit : -2;
+                    SPC_TRC("sched: seq=%d admit=%d/%d gamma_next=%d ema_acc=%.2f over=%.1fms\n",
+                            (int) seq_id, n_admit, n_block_tokens, ss.gamma, ss.ema_acc,
+                            sched_overhead_s > 0 ? sched_overhead_s * 1e3f : -1.0f);
                 }
 
                 for (int32_t i = 0; i < (params.sched ? n_admit : n_block_tokens); ++i) {

@@ -4031,13 +4031,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
         {"--spec-sched"},
-        string_format("confidence-scheduled DSpark drafting: per-round draft admission by expected-throughput "
-                      "maximization, adaptive draft depth and skip-drafting on low-acceptance content (default: %s)",
-                      params.speculative.draft.sched ? "enabled" : "disabled"),
+        string_format("confidence-scheduled DSpark drafting (paper Alg. 1): per-round draft admission by "
+                      "expected-throughput maximization against the SPS capacity curve profiled at startup "
+                      "(default: %s)", params.speculative.draft.sched ? "enabled" : "disabled"),
         [](common_params & params) {
             params.speculative.draft.sched = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SCHED"));
+    add_opt(common_arg(
+        {"--spec-sched-adapt"},
+        string_format("non-paper scheduler extensions: adaptive draft depth, skip-drafting on low-acceptance "
+                      "content, admission-size quantization (default: %s)",
+                      params.speculative.draft.sched_adapt ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.speculative.draft.sched_adapt = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SCHED_ADAPT"));
+    add_opt(common_arg(
+        {"--spec-conf-log"}, "FNAME",
+        "append per-round DSpark confidence vectors and realized accepted lengths to FNAME "
+        "(fitting data for scripts/dspark-sts-fit.py)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.sched_conf_log = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CONF_LOG"));
     add_opt(common_arg(
         {"--spec-sts"}, "T0,T1,...",
         "sequential temperature scaling for the DSpark confidence head: per-position temperatures, "
@@ -4076,8 +4093,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_STS_BIAS"));
     add_opt(common_arg(
         {"--spec-sched-beta"}, "F",
-        string_format("scheduler cost model: marginal verify cost of one extra draft token, relative to a "
-                      "1-token target round (default: %.3f)", (double)params.speculative.draft.sched_beta),
+        string_format("override the profiled SPS curve with the analytic model 1/(1+beta*l); 0 = profile "
+                      "real decode latencies at startup (default: %.3f)", (double)params.speculative.draft.sched_beta),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.sched_beta = std::stof(value);
         }

@@ -332,14 +332,25 @@ struct common_params_speculative_draft {
     // (-1 - derive from the configured sampling top-k, 0 - disable, draft greedily)
     int32_t dspark_n_cand = -1;
 
-    // DSpark confidence-scheduled drafting (arXiv DSpark paper, Alg. 1):
-    // per-round draft admission by expected-throughput maximization over the
-    // calibrated prefix-survival probabilities, adaptive next-round draft
-    // depth, and skip-drafting on persistently low-acceptance content.
+    // DSpark confidence-scheduled drafting (DSpark paper, Alg. 1): per-round
+    // draft admission maximizing expected throughput over the calibrated
+    // prefix-survival probabilities against the PROFILED hardware capacity
+    // curve SPS(n) (target decode latency probed at every verify size at
+    // startup - the paper's hardware-aware scheduler). sched_beta > 0
+    // replaces the profiled curve with the analytic model 1/(1+beta*l).
     bool  sched            = false;
-    float sched_beta       = 0.02f; // marginal verify cost of one extra draft token, relative to a 1-token target round
+    float sched_beta       = 0.0f;  // 0 = profile SPS at startup (paper); >0 = analytic override
+    // non-paper extensions (llama.cpp-specific), enabled by sched_adapt:
+    // adaptive next-round draft depth, skip-drafting on persistently
+    // low-acceptance content, and admission-size quantization for
+    // graph-reuse stability.
+    bool  sched_adapt      = false;
     float sched_draft_cost = 0.25f; // draft block cost relative to a 1-token target round (drives skip-drafting)
     int32_t sched_probe    = 8;     // plain rounds between draft probes while skipping
+
+    // append per-round confidence vectors + realized accepted lengths to this
+    // file (fitting data for scripts/dspark-sts-fit.py)
+    std::string sched_conf_log;
 
     // Sequential Temperature Scaling (paper 3.2.1), extended with a logit
     // bias: c' = sigmoid(logit(c)/T + b). The bias absorbs the systematic

@@ -18,15 +18,23 @@ substantially faster and adds exact sampled acceptance:
   host copies
 - host-path fixes: deferred sampler clone, batch-init scan guard
 - **confidence-scheduled drafting** (`--spec-sched`, off by default):
-  the DSpark paper's Alg. 1 — throughput-maximizing draft admission over
-  the trained confidence head, adaptive draft depth, and skip-drafting on
-  persistently low-acceptance content — with confidence calibration via
-  `--spec-sts` / `--spec-sts-bias` (start with `--spec-sts-bias 1.5`).
-  Single-user tool for regimes where fixed-depth speculation loses to
-  plain decoding (very long contexts, hard content); measured parity on
-  structured content at bs1. Leave OFF for batched serving: the server's
-  host loop, not verify compute, is the batch ceiling, so admission
-  truncation only reduces accepted length there.
+  the DSpark paper's Alg. 1 — expected-throughput-maximizing draft
+  admission over the trained confidence head with the paper's causal
+  early stop, against a hardware cost curve that is *measured*, not
+  assumed: the target's decode latency is profiled per verify size at
+  startup, and the fixed-round and per-emitted-token costs are regressed
+  online from real rounds. Calibration per paper §3.2.1: log serving
+  data with `--spec-conf-log`, fit per-position temperatures with
+  `scripts/dspark-sts-fit.py`, pass them via `--spec-sts` (a logit bias
+  `--spec-sts-bias` is also available). Non-paper extensions (adaptive
+  draft depth, skip-drafting, admission-size quantization) live behind
+  `--spec-sched-adapt`. Honest guidance: on hardware where verify
+  tokens are cheap this is parity-at-best with fixed-depth drafting —
+  it is a tool for regimes where speculation loses to plain decoding
+  outright (very long contexts, hard content, weaker GPUs). Leave OFF
+  for batched serving: the server's host loop, not verify compute, is
+  the batch ceiling, so admission truncation only reduces accepted
+  length there.
 
 **Measured** (Qwen3.6-35B-A3B NVFP4 target + [DSPARK v2
 draft](https://huggingface.co/Koopah/Qwen3.6-35B-A3B-NVFP4-DSPARK-v2-GGUF),
