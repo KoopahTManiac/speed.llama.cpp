@@ -352,6 +352,12 @@ struct common_params_speculative_draft {
     // file (fitting data for scripts/dspark-sts-fit.py)
     std::string sched_conf_log;
 
+    // scheduler self-calibration cache: STS temperatures and the online cost
+    // model are fitted from live serving rounds and persisted here, so later
+    // boots start warm. "auto" (default) = per-draft-model file in the llama
+    // cache directory; "none" disables persistence.
+    std::string sched_cache = "auto";
+
     // Sequential Temperature Scaling (paper 3.2.1), extended with a logit
     // bias: c' = sigmoid(logit(c)/T + b). The bias absorbs the systematic
     // shift between the head's training game (temp-1.0 full-vocab TV labels)

@@ -12,6 +12,7 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -954,7 +955,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         int32_t gamma        = 0;     // adaptive draft depth for the next round (0 = params.n_max)
         int32_t last_n_past  = -1;    // n_past at the last drafted round
         bool    prev_drafted = false; // whether the previous round drafted (arms the EMA update)
-        std::vector<float> last_conf; // raw confidences of the last drafted round (conf logging)
+        bool    last_full    = false; // last round verified the full trained block (uncensored outcome)
+        std::vector<float> last_conf; // raw confidences of the last drafted round
     };
     std::vector<sched_state> sched_st;
 
@@ -1044,22 +1046,153 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         LOG_INF("%s: profiled SPS latency curve (ms, verify size 1..%d): %s\n", __func__, n_probe, curve.c_str());
     }
 
+    // active STS temperatures: user-supplied (--spec-sts, never auto-refit)
+    // or self-calibrated from live rounds (empty until the first fit)
+    std::vector<float> sts_active;
+    bool               sts_user = false;
+
     // Sequential Temperature Scaling (paper 3.2.1) with logit bias:
     // c' = sigmoid(logit(c)/T + b). The bias lifts the head's systematically
     // pessimistic estimates into the serving game's acceptance scale.
     float sts_calibrate(float c, int32_t pos) const {
         c = std::min(std::max(c, 1e-6f), 1.0f - 1e-6f);
-        if (params.sts.empty() && params.sts_bias.empty()) {
+        if (sts_active.empty() && params.sts_bias.empty()) {
             return c;
         }
         float z = std::log(c / (1.0f - c));
-        if (!params.sts.empty()) {
-            z /= params.sts[std::min((size_t) pos, params.sts.size() - 1)];
+        if (!sts_active.empty()) {
+            z /= sts_active[std::min((size_t) pos, sts_active.size() - 1)];
         }
         if (!params.sts_bias.empty()) {
             z += params.sts_bias[std::min((size_t) pos, params.sts_bias.size() - 1)];
         }
         return 1.0f / (1.0f + std::exp(-z));
+    }
+
+    // self-calibration data: ring buffer of (full-block confidences, realized
+    // accepted length) from exploration rounds; refit every CAL_REFIT new
+    // rounds via the paper's sequential cumprod-ECE grid search
+    static constexpr int32_t CAL_CAP     = 4096;
+    static constexpr int32_t CAL_MIN_FIT = 384;
+    static constexpr int32_t CAL_REFIT   = 256;
+    static constexpr int32_t CAL_EXPLORE = 16; // every Nth drafted round verifies the full block
+    std::vector<float>   cal_conf; // CAL_CAP x block_size, ring
+    std::vector<int8_t>  cal_acc;  // CAL_CAP, ring
+    int32_t cal_head = 0, cal_n = 0, cal_since_fit = 0;
+    int64_t round_counter = 0;
+    std::string cache_path;
+
+    void sts_autofit() {
+        const int32_t bs = block_size;
+        // most recent window only: keeps the inline refit ~3ms in the serving
+        // thread and tracks the current content mix
+        const int32_t n  = std::min(cal_n, 1024);
+        const int32_t beg_r = (cal_head - n + CAL_CAP) % CAL_CAP;
+        auto ring = [&](int32_t r) { return (size_t) ((beg_r + r) % CAL_CAP); };
+        std::vector<float> cum(n, 1.0f);
+        std::vector<float> temps;
+        static const auto grid = [] {
+            std::array<float, 48> g{};
+            for (size_t i = 0; i < g.size(); ++i) {
+                g[i] = 0.05f * std::pow(1.15f, (float) i);
+            }
+            return g;
+        }();
+        std::vector<std::pair<float, float>> pl(n); // (pred, label) scratch
+        for (int32_t k = 0; k < bs; ++k) {
+            float best_T = 1.0f, best_e = 1e9f;
+            for (const float T : grid) {
+                for (int32_t r = 0; r < n; ++r) {
+                    float c = std::min(std::max(cal_conf[ring(r) * bs + k], 1e-6f), 1.0f - 1e-6f);
+                    pl[r] = { cum[r] / (1.0f + std::pow((1.0f - c) / c, 1.0f / T)),
+                              cal_acc[ring(r)] > k ? 1.0f : 0.0f };
+                }
+                // ECE over 15 equal-count bins
+                std::sort(pl.begin(), pl.end());
+                float e = 0.0f;
+                const int32_t bins = 15;
+                for (int32_t b = 0; b < bins; ++b) {
+                    const int32_t lo = b * n / bins, hi = (b + 1) * n / bins;
+                    if (hi <= lo) {
+                        continue;
+                    }
+                    float p = 0.0f, y = 0.0f;
+                    for (int32_t i = lo; i < hi; ++i) {
+                        p += pl[i].first;
+                        y += pl[i].second;
+                    }
+                    e += std::fabs(p - y) / (float) n;
+                }
+                if (e < best_e) {
+                    best_e = e;
+                    best_T = T;
+                }
+            }
+            temps.push_back(best_T);
+            for (int32_t r = 0; r < n; ++r) {
+                float c = std::min(std::max(cal_conf[ring(r) * bs + k], 1e-6f), 1.0f - 1e-6f);
+                cum[r] /= 1.0f + std::pow((1.0f - c) / c, 1.0f / best_T);
+            }
+        }
+        sts_active = std::move(temps);
+        std::string s;
+        for (size_t i = 0; i < sts_active.size(); ++i) {
+            s += string_format("%s%.3f", i ? "," : "", sts_active[i]);
+        }
+        LOG_INF("%s: STS self-calibration refit on %d rounds: %s\n", __func__, n, s.c_str());
+        sched_cache_save();
+    }
+
+    void sched_cache_save() const {
+        if (cache_path.empty()) {
+            return;
+        }
+        FILE * f = fopen(cache_path.c_str(), "wb");
+        if (!f) {
+            return;
+        }
+        const uint32_t magic = 0x53505343, version = 1; // "SPSC"
+        const uint32_t n_sts = (uint32_t) sts_active.size();
+        fwrite(&magic,   4, 1, f);
+        fwrite(&version, 4, 1, f);
+        fwrite(&n_sts,   4, 1, f);
+        fwrite(sts_active.data(), sizeof(float), n_sts, f);
+        fwrite(&t_fix, sizeof(float), 1, f);
+        fwrite(&c_tok, sizeof(float), 1, f);
+        fclose(f);
+    }
+
+    void sched_cache_load() {
+        if (cache_path.empty()) {
+            return;
+        }
+        FILE * f = fopen(cache_path.c_str(), "rb");
+        if (!f) {
+            return;
+        }
+        uint32_t magic = 0, version = 0, n_sts = 0;
+        bool ok = fread(&magic, 4, 1, f) == 1 && magic == 0x53505343 &&
+                  fread(&version, 4, 1, f) == 1 && version == 1 &&
+                  fread(&n_sts, 4, 1, f) == 1 && n_sts <= 64;
+        if (ok) {
+            std::vector<float> temps(n_sts);
+            float tf = -1.0f, ct = 0.0f;
+            ok = fread(temps.data(), sizeof(float), n_sts, f) == n_sts &&
+                 fread(&tf, sizeof(float), 1, f) == 1 &&
+                 fread(&ct, sizeof(float), 1, f) == 1;
+            if (ok) {
+                if (!sts_user && !temps.empty()) {
+                    sts_active = std::move(temps);
+                }
+                if (tf > 0.0f) {
+                    t_fix = tf;
+                }
+                c_tok = std::min(std::max(ct, 0.0f), 0.01f);
+                LOG_INF("%s: loaded scheduler calibration cache '%s' (sts=%zu, t_fix=%.1fms, c_tok=%.2fms)\n",
+                        __func__, cache_path.c_str(), sts_active.size(), t_fix * 1e3f, c_tok * 1e3f);
+            }
+        }
+        fclose(f);
     }
 
     // quantized draft depths: bounds draft-graph shape churn to a few sizes
@@ -1152,6 +1285,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             this->params.sched_conf_log.c_str());
                 }
             }
+            // self-calibration: user-supplied temperatures disable auto-refit;
+            // otherwise STS is fitted from live rounds and persisted
+            sts_user   = !this->params.sts.empty();
+            sts_active = this->params.sts;
+            if (this->params.sched_cache != "none") {
+                cache_path = this->params.sched_cache == "auto"
+                    ? fs_get_cache_file(string_format("dspark_sched_%zx.bin",
+                              std::hash<std::string>{}(this->params.mparams.path)))
+                    : this->params.sched_cache;
+            }
+            sched_cache_load();
+            cal_conf.assign((size_t) CAL_CAP * block_size, 0.0f);
+            cal_acc.assign(CAL_CAP, 0);
         }
         sched_st.resize(n_seq);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
@@ -1202,6 +1348,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (conf_log) {
             fclose(conf_log);
         }
+        sched_cache_save();
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1418,8 +1565,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                         fputc('\n', conf_log);
                     }
+
+                    // self-calibration: full-block rounds give uncensored
+                    // survival labels for every position - ring-buffer them
+                    // and refit STS periodically
+                    if (ss.last_full && (int32_t) ss.last_conf.size() == block_size && !cal_conf.empty()) {
+                        std::memcpy(cal_conf.data() + (size_t) cal_head * block_size,
+                                    ss.last_conf.data(), (size_t) block_size * sizeof(float));
+                        cal_acc[cal_head] = (int8_t) std::min((int32_t) acc, block_size);
+                        cal_head = (cal_head + 1) % CAL_CAP;
+                        cal_n    = std::min(cal_n + 1, CAL_CAP);
+                        cal_since_fit++;
+                        if (!sts_user && cal_n >= CAL_MIN_FIT && cal_since_fit >= CAL_REFIT) {
+                            cal_since_fit = 0;
+                            sts_autofit();
+                        }
+                    }
                 }
                 ss.prev_drafted = false;
+                ss.last_full    = false;
                 ss.last_conf.clear();
 
                 // skip-drafting (non-paper, sched_adapt): when the acceptance
@@ -1547,9 +1711,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 int32_t n_admit = n_block_tokens;
                 if (params.sched) {
                     auto & ss = sched_st[seq_id];
-                    if (conf_log) {
-                        ss.last_conf.resize(n_block_tokens);
-                    }
+                    ss.last_conf.resize(n_block_tokens);
                     // theta_l = E[tokens] / E[round time] with the profiled
                     // three-component cost: fixed + decode(size) + per-token
                     const bool  prof   = !sps_t.empty();
@@ -1566,9 +1728,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     for (int32_t i = 0; i < n_block_tokens; ++i) {
                         const size_t row = (size_t) (beg + i) * n_embd_dec;
                         const float  c   = xtra[row + LLAMA_DSPARK_NEXTN_ROW_CONF];
-                        if (conf_log) {
-                            ss.last_conf[i] = c;
-                        }
+                        ss.last_conf[i] = c;
                         a_prod *= sts_calibrate(c, i);
                         sum_a  += a_prod;
                         const float theta = theta_at(i + 1, 1.0f + sum_a);
@@ -1586,12 +1746,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         ss.gamma = sched_quantize_gamma(n_admit + 2, params.n_max);
                         n_admit  = sched_quantize_admit(n_admit, n_block_tokens);
                     }
-                    // conf logging pairs the FULL block's confidences with the
-                    // realized outcome, so log rounds must verify the full
-                    // block to observe deep positions
-                    if (conf_log) {
+                    // exploration: every CAL_EXPLORE-th round verifies the
+                    // full block so deep positions keep producing uncensored
+                    // calibration data (scheduled truncation would otherwise
+                    // censor them and freeze the fit); conf-log mode logs
+                    // every round full-block
+                    round_counter++;
+                    if (conf_log || (!sts_user && round_counter % CAL_EXPLORE == 0)) {
                         n_admit = n_block_tokens;
                     }
+                    ss.last_full = n_admit == n_block_tokens && n_block_tokens == block_size;
                     // feed the online overhead estimator (valid only when this
                     // was the round's single drafting sequence)
                     prev_verify_idx = prev_verify_idx == -1 ? n_admit : -2;

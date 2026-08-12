@@ -23,10 +23,15 @@ substantially faster and adds exact sampled acceptance:
   early stop, against a hardware cost curve that is *measured*, not
   assumed: the target's decode latency is profiled per verify size at
   startup, and the fixed-round and per-emitted-token costs are regressed
-  online from real rounds. Calibration per paper §3.2.1: log serving
-  data with `--spec-conf-log`, fit per-position temperatures with
-  `scripts/dspark-sts-fit.py`, pass them via `--spec-sts` (a logit bias
-  `--spec-sts-bias` is also available). Non-paper extensions (adaptive
+  online from real rounds. Calibration per paper §3.2.1 is automatic:
+  the server collects confidence/outcome pairs from live rounds (with
+  periodic full-block exploration so truncation never censors deep
+  positions), refits the per-position STS temperatures in-process, and
+  persists everything to a per-model cache (`--spec-sched-cache`) so
+  later boots start warm. `--spec-sts` overrides the self-calibration
+  with fixed temperatures (fit offline via `--spec-conf-log` +
+  `scripts/dspark-sts-fit.py`); a logit bias `--spec-sts-bias` is also
+  available. Non-paper extensions (adaptive
   draft depth, skip-drafting, admission-size quantization) live behind
   `--spec-sched-adapt`. Honest guidance: on hardware where verify
   tokens are cheap this is parity-at-best with fixed-depth drafting —

@@ -4048,6 +4048,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SCHED_ADAPT"));
     add_opt(common_arg(
+        {"--spec-sched-cache"}, "FNAME",
+        "scheduler self-calibration cache file; 'auto' = per-draft-model file in the llama cache "
+        "directory, 'none' = no persistence (default: auto)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.sched_cache = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SCHED_CACHE"));
+    add_opt(common_arg(
         {"--spec-conf-log"}, "FNAME",
         "append per-round DSpark confidence vectors and realized accepted lengths to FNAME "
         "(fitting data for scripts/dspark-sts-fit.py)",
